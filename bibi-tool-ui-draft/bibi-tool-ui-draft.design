@@ -1,0 +1,162 @@
+{
+  "data": [
+    {
+      "id": "page-config",
+      "title": "AI 配置",
+      "type": "page",
+      "version": 1,
+      "createdAt": 1751818800000,
+      "canvasData": {
+        "x": 0,
+        "y": 0,
+        "group": 0
+      },
+      "devMetadata": {
+        "htmlSrc": "pages/config.html",
+        "interactions": [
+          {
+            "domId": "config-save",
+            "targetPageId": "page-login",
+            "transitionLabel": "保存配置后登录"
+          }
+        ]
+      }
+    },
+    {
+      "id": "page-login",
+      "title": "扫码登录",
+      "type": "page",
+      "version": 1,
+      "createdAt": 1751818800000,
+      "canvasData": {
+        "x": 620,
+        "y": 0,
+        "group": 0
+      },
+      "devMetadata": {
+        "htmlSrc": "pages/login.html",
+        "interactions": [
+          {
+            "domId": "login-success",
+            "targetPageId": "page-home",
+            "transitionLabel": "登录成功"
+          }
+        ]
+      }
+    },
+    {
+      "id": "page-home",
+      "title": "选择收藏夹",
+      "type": "page",
+      "version": 1,
+      "createdAt": 1751818800000,
+      "canvasData": {
+        "x": 1240,
+        "y": 0,
+        "group": 0
+      },
+      "devMetadata": {
+        "htmlSrc": "pages/home.html",
+        "interactions": [
+          {
+            "domId": "select-folder",
+            "targetPageId": "page-progress",
+            "transitionLabel": "选择收藏夹"
+          },
+          {
+            "domId": "resume-session",
+            "targetPageId": "page-review",
+            "hideEdge": true,
+            "transitionLabel": "恢复会话"
+          },
+          {
+            "domId": "nav-settings",
+            "targetPageId": "page-config",
+            "hideEdge": true,
+            "transitionLabel": "设置"
+          }
+        ]
+      }
+    },
+    {
+      "id": "page-progress",
+      "title": "采集与分类",
+      "type": "page",
+      "version": 1,
+      "createdAt": 1751818800000,
+      "canvasData": {
+        "x": 1860,
+        "y": 0,
+        "group": 0
+      },
+      "devMetadata": {
+        "htmlSrc": "pages/progress.html",
+        "interactions": [
+          {
+            "domId": "classify-done",
+            "targetPageId": "page-review",
+            "transitionLabel": "分类完成"
+          }
+        ]
+      }
+    },
+    {
+      "id": "page-review",
+      "title": "预览与调整",
+      "type": "page",
+      "version": 1,
+      "createdAt": 1751818800000,
+      "canvasData": {
+        "x": 2480,
+        "y": 0,
+        "group": 0
+      },
+      "devMetadata": {
+        "htmlSrc": "pages/review.html",
+        "interactions": [
+          {
+            "domId": "execute-confirm",
+            "targetPageId": "page-result",
+            "transitionLabel": "确认执行"
+          }
+        ]
+      }
+    },
+    {
+      "id": "page-result",
+      "title": "执行结果",
+      "type": "page",
+      "version": 1,
+      "createdAt": 1751818800000,
+      "canvasData": {
+        "x": 3100,
+        "y": 0,
+        "group": 0
+      },
+      "devMetadata": {
+        "htmlSrc": "pages/result.html",
+        "interactions": [
+          {
+            "domId": "back-home",
+            "targetPageId": "page-home",
+            "hideEdge": true,
+            "transitionLabel": "返回首页"
+          }
+        ]
+      }
+    }
+  ],
+  "config": {
+    "autoLayout": true,
+    "deviceType": "desktop",
+    "projectName": "B站收藏夹分类工具 (美化版)",
+    "designLibrary": {
+      "name": "苹果",
+      "id": "dl_builtin_apple",
+      "version": null,
+      "scope": "built-in-global",
+      "path": "c:\\Users\\GZY\\.trae-cn\\design_libraries\\dl_builtin_apple",
+      "versionSource": null
+    }
+  }
+}

@@ -1,0 +1,188 @@
+{
+  "project": {
+    "name": "B站收藏夹分类工具",
+    "path": "d:\\GZY\\TraeComm\\BiBiTool\\bibi-tool-ui",
+    "operation": "create",
+    "deviceType": "desktop",
+    "language": "zh-CN",
+    "dashboardMode": false,
+    "replicationMode": null,
+    "sourceUrl": null,
+    "visualSpecExcerpt": null,
+    "styleDefinitionBrief": "本地工具类 SPA，Apple 极简风格，清爽浅色背景，任务驱动型界面，注重流程清晰度和操作效率",
+    "designRead": "task-driven SPA / 个人开发者工具 / 简洁克制 / 中等密度 / 避免过度装饰",
+    "designDials": {
+      "layoutVariance": 2,
+      "motionIntensity": 2,
+      "visualDensity": 3
+    },
+    "styleContinuityAnchors": {
+      "colorSystem": {
+        "primaryColorRole": "品牌蓝 #007AFF 用于主要操作按钮和选中态",
+        "brandHuePolicy": "单一品牌蓝色调，状态语义色仅用于成功/失败/警告",
+        "stateColors": "success #34c759, error #ff3b30, warning #ff9f0a"
+      },
+      "shapeSystem": "圆角 19.2px (1.2rem)，按钮 pill 形状，卡片和输入框统一柔和圆角",
+      "typographySystem": "DM Sans 界面字体，JetBrains Mono 技术细节，中文 PingFang SC 兜底",
+      "spacingSystem": "基础 3.84px，常用 8/12/16/24/32px，宽松留白优先于分割线",
+      "componentLanguage": "Apple 风格卡片、圆角输入框、pill 按钮、轻阴影边框",
+      "surfaceAndDepth": "1px 边框为主，极轻阴影 0.04 opacity，仅浮动层用深阴影",
+      "imageryAndIconography": "线条图标为主，产品截图自然展示",
+      "interactionTone": "克制动效 150-250ms，hover 轻微提升"
+    },
+    "specsConstraints": null,
+    "sharedProjectShellContract": {
+      "navigationShell": "固定顶部导航栏，包含工具名和设置入口，无侧边栏",
+      "primaryColorSystem": "#007AFF 品牌蓝",
+      "typographySystem": "DM Sans + PingFang SC，标题 600 weight，正文 400 weight",
+      "radiusScale": "sm 4px, md 8px, lg 12px, xl 19.2px, full 9999px",
+      "surfaceDepthModel": "卡片 1px border + shadow-xs，hover shadow-sm，modal shadow-xl",
+      "ctaStyle": "pill 形状主按钮，圆角输入框，轻灰辅助按钮",
+      "alignmentRules": "居中布局 max-width 680px，卡片内 padding 24px，间距 16px"
+    },
+    "generationTree": {
+      "root": {
+        "nodeId": "gen-project-shell",
+        "kind": "project-shell",
+        "pageIds": ["page-config", "page-login", "page-home", "page-progress", "page-review", "page-result"],
+        "output": "partials/project-shell.html",
+        "sharedRegions": ["header"],
+        "privateRegions": [],
+        "mutableSlots": ["pageTitle", "pageBody"],
+        "status": "planned",
+        "children": [
+          { "nodeId": "gen-page-config", "kind": "page-leaf", "pageIds": ["page-config"], "output": "pages/config.html", "status": "planned", "children": [] },
+          { "nodeId": "gen-page-login", "kind": "page-leaf", "pageIds": ["page-login"], "output": "pages/login.html", "status": "planned", "children": [] },
+          { "nodeId": "gen-page-home", "kind": "page-leaf", "pageIds": ["page-home"], "output": "pages/home.html", "status": "planned", "children": [] },
+          { "nodeId": "gen-page-progress", "kind": "page-leaf", "pageIds": ["page-progress"], "output": "pages/progress.html", "status": "planned", "children": [] },
+          { "nodeId": "gen-page-review", "kind": "page-leaf", "pageIds": ["page-review"], "output": "pages/review.html", "status": "planned", "children": [] },
+          { "nodeId": "gen-page-result", "kind": "page-leaf", "pageIds": ["page-result"], "output": "pages/result.html", "status": "planned", "children": [] }
+        ]
+      }
+    }
+  },
+  "designSource": {
+    "operatingMode": "library-bound",
+    "libraryIdentity": {
+      "name": "苹果",
+      "id": "dl_builtin_apple",
+      "version": null,
+      "scope": "built-in-global",
+      "path": "c:\\Users\\GZY\\.trae-cn\\design_libraries\\dl_builtin_apple",
+      "versionSource": null
+    },
+    "brandPrefix": "",
+    "cssFilePath": "c:\\Users\\GZY\\.trae-cn\\design_libraries\\dl_builtin_apple\\colors_and_type.css",
+    "cssJsonPath": "c:\\Users\\GZY\\.trae-cn\\design_libraries\\dl_builtin_apple\\css.json",
+    "designDecisionSummary": "Apple 极简风格：Pinguo Blue #0066cc 主色，DM Sans 字体，1.2rem 柔和圆角，Silver Mist #f5f5f7 背景，whisper-light 阴影",
+    "iconAssets": null,
+    "forbiddenInventedComponents": null,
+    "allowedComponents": null,
+    "styleConstraints": {
+      "radiusMax": 19.2,
+      "spacingBase": 3.84,
+      "fontSizeBody": 16,
+      "controlHeightDefault": 44
+    }
+  },
+  "pages": [
+    {
+      "nodeId": "page-config",
+      "title": "AI 配置",
+      "htmlSrc": "pages/config.html",
+      "pageType": "task-driven",
+      "visualNorthStar": "简洁的表单配置页，三个输入字段（Base URL、API Key、模型名）加一个保存按钮，居中布局，卡片容器",
+      "compositionPattern": "single-card-centered",
+      "continuityAnchors": {
+        "shell": "共享顶部导航栏 + 居中卡片容器 + 统一背景色",
+        "unique": "配置表单三个字段 + 保存按钮"
+      },
+      "imagePlan": [],
+      "chartsRequired": false
+    },
+    {
+      "nodeId": "page-login",
+      "title": "扫码登录",
+      "htmlSrc": "pages/login.html",
+      "pageType": "task-driven",
+      "visualNorthStar": "居中展示二维码，下方状态文字，简洁引导式布局",
+      "compositionPattern": "single-card-centered",
+      "continuityAnchors": {
+        "shell": "共享顶部导航栏 + 居中卡片容器 + 统一背景色",
+        "unique": "二维码图片 + 扫码状态文字 + 刷新按钮"
+      },
+      "imagePlan": [],
+      "chartsRequired": false
+    },
+    {
+      "nodeId": "page-home",
+      "title": "选择收藏夹",
+      "htmlSrc": "pages/home.html",
+      "pageType": "task-driven",
+      "visualNorthStar": "收藏夹列表页，可选恢复未完成会话，列表项展示封面、标题、视频数量",
+      "compositionPattern": "list-with-header",
+      "continuityAnchors": {
+        "shell": "共享顶部导航栏 + 统一背景色",
+        "unique": "未完成会话提示 + 收藏夹列表 + 模式选择"
+      },
+      "imagePlan": [],
+      "chartsRequired": false
+    },
+    {
+      "nodeId": "page-progress",
+      "title": "采集与分类",
+      "htmlSrc": "pages/progress.html",
+      "pageType": "task-driven",
+      "visualNorthStar": "进度展示页，两阶段进度条（采集视频 + AI 分类），状态文字提示当前步骤",
+      "compositionPattern": "single-card-centered",
+      "continuityAnchors": {
+        "shell": "共享顶部导航栏 + 居中卡片容器 + 统一背景色",
+        "unique": "两阶段进度条 + 步骤指示 + 状态文字"
+      },
+      "imagePlan": [],
+      "chartsRequired": false
+    },
+    {
+      "nodeId": "page-review",
+      "title": "预览与调整",
+      "htmlSrc": "pages/review.html",
+      "pageType": "information-dense",
+      "visualNorthStar": "分类方案预览页，按分类分组展示视频，每组显示分类名和视频数量，视频行包含封面缩略图、标题、UP主、置信度、可调下拉框",
+      "compositionPattern": "grouped-list",
+      "continuityAnchors": {
+        "shell": "共享顶部导航栏 + 统一背景色",
+        "unique": "分类分组 + 视频列表 + 调整下拉框 + 确认执行按钮"
+      },
+      "imagePlan": [],
+      "chartsRequired": false
+    },
+    {
+      "nodeId": "page-result",
+      "title": "执行结果",
+      "htmlSrc": "pages/result.html",
+      "pageType": "task-driven",
+      "visualNorthStar": "执行完成页，展示成功/失败统计数字，失败项可重试，返回首页按钮",
+      "compositionPattern": "single-card-centered",
+      "continuityAnchors": {
+        "shell": "共享顶部导航栏 + 居中卡片容器 + 统一背景色",
+        "unique": "统计数字 + 失败列表 + 重试按钮 + 返回按钮"
+      },
+      "imagePlan": [],
+      "chartsRequired": false
+    }
+  ],
+  "assets": [],
+  "wiringPlan": [
+    { "from": "page-config", "to": "page-login", "domId": "config-save", "label": "保存配置后登录" },
+    { "from": "page-login", "to": "page-home", "domId": "login-success", "label": "登录成功" },
+    { "from": "page-home", "to": "page-progress", "domId": "select-folder", "label": "选择收藏夹" },
+    { "from": "page-progress", "to": "page-review", "domId": "classify-done", "label": "分类完成" },
+    { "from": "page-review", "to": "page-result", "domId": "execute-confirm", "label": "确认执行" }
+  ],
+  "hiddenInteractionPlan": [
+    { "from": "page-home", "to": "page-review", "domId": "resume-session", "label": "恢复会话" },
+    { "from": "page-home", "to": "page-config", "domId": "nav-settings", "label": "设置" },
+    { "from": "page-result", "to": "page-home", "domId": "back-home", "label": "返回首页" },
+    { "from": "page-result", "to": "page-review", "domId": "back-review", "label": "返回预览" }
+  ]
+}

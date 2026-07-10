@@ -1,0 +1,16 @@
+config.json
+bilibili_cookie.json
+bibi.db
+bibi.db-journal
+bibi.db-wal
+bibi.db-shm
+__pycache__/
+.venv/
+.libs/
+_libs/
+*.pyc
+.pytest_cache/
+accounts/
+*.bak
+*.bak-*
+bibi.db.backup-*

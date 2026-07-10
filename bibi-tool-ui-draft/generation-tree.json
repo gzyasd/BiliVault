@@ -1,0 +1,20 @@
+{
+  "root": {
+    "nodeId": "gen-project-shell",
+    "kind": "project-shell",
+    "pageIds": ["page-config", "page-login", "page-home", "page-progress", "page-review", "page-result"],
+    "output": "partials/project-shell.html",
+    "sharedRegions": ["header"],
+    "privateRegions": [],
+    "mutableSlots": ["pageTitle", "pageBody"],
+    "status": "planned",
+    "children": [
+      { "nodeId": "gen-page-config", "kind": "page-leaf", "pageIds": ["page-config"], "output": "pages/config.html", "status": "planned", "children": [] },
+      { "nodeId": "gen-page-login", "kind": "page-leaf", "pageIds": ["page-login"], "output": "pages/login.html", "status": "planned", "children": [] },
+      { "nodeId": "gen-page-home", "kind": "page-leaf", "pageIds": ["page-home"], "output": "pages/home.html", "status": "planned", "children": [] },
+      { "nodeId": "gen-page-progress", "kind": "page-leaf", "pageIds": ["page-progress"], "output": "pages/progress.html", "status": "planned", "children": [] },
+      { "nodeId": "gen-page-review", "kind": "page-leaf", "pageIds": ["page-review"], "output": "pages/review.html", "status": "planned", "children": [] },
+      { "nodeId": "gen-page-result", "kind": "page-leaf", "pageIds": ["page-result"], "output": "pages/result.html", "status": "planned", "children": [] }
+    ]
+  }
+}
