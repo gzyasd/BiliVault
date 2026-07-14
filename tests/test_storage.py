@@ -115,6 +115,32 @@ def test_create_and_load_session(tmp_path):
     assert s["mode"] == "quick"
 
 
+def test_create_session_persists_category_limit(tmp_path):
+    storage = Storage(tmp_path)
+
+    sid = storage.create_session(source_fid=100, mode="quick", category_limit=8)
+
+    assert storage.load_session(sid)["category_limit"] == 8
+
+
+def test_storage_migrates_category_limit_for_existing_sessions(tmp_path):
+    db_path = tmp_path / "bibi.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "CREATE TABLE classify_sessions ("
+            "session_id TEXT PRIMARY KEY, source_fid INTEGER, status TEXT, mode TEXT, "
+            "account_id TEXT, created_at TEXT, updated_at TEXT, stats TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO classify_sessions VALUES "
+            "('legacy', 100, 'draft', 'quick', '', 'now', 'now', '{}')"
+        )
+
+    storage = Storage(tmp_path)
+
+    assert storage.load_session("legacy")["category_limit"] == 14
+
+
 def test_update_session_status(tmp_path):
     storage = Storage(tmp_path)
     sid = storage.create_session(source_fid=100, mode="quick")
@@ -613,3 +639,49 @@ def test_storage_migrates_half_migrated_videos_preserves_resource_type(tmp_path)
         assert row["resource_type"] == 11
         assert row["avid"] == 0
         assert row["title"] == "合集半迁移"
+
+
+def test_cleanup_scan_persists_progress_and_isolated_by_account(tmp_path):
+    storage = Storage(tmp_path)
+    scan_id = storage.create_cleanup_scan("account-a", folders_total=3)
+
+    storage.update_cleanup_scan(
+        scan_id,
+        status="scanning",
+        folders_scanned=2,
+        resources_scanned=120,
+        problem_total=4,
+    )
+
+    scan = storage.get_cleanup_scan(scan_id, account_id="account-a")
+    assert scan["status"] == "scanning"
+    assert scan["folders_scanned"] == 2
+    assert scan["resources_scanned"] == 120
+    assert storage.get_cleanup_scan(scan_id, account_id="account-b") is None
+    assert storage.get_latest_cleanup_scan("account-a")["scan_id"] == scan_id
+    assert storage.get_latest_cleanup_scan("account-b") is None
+
+
+def test_cleanup_items_use_folder_resource_composite_key(tmp_path):
+    storage = Storage(tmp_path)
+    scan_id = storage.create_cleanup_scan("account-a", folders_total=2)
+    item = {
+        "source_fid": 100,
+        "source_title": "默认收藏夹",
+        "resource_id": 88,
+        "resource_type": 2,
+        "bvid": "BV88",
+        "title": "已失效视频",
+        "problem_type": "invalid",
+        "problem_label": "已失效",
+    }
+    storage.add_cleanup_items(scan_id, [item, item, {**item, "source_fid": 200, "source_title": "另一个收藏夹"}])
+
+    items = storage.list_cleanup_items(scan_id)
+    assert len(items) == 2
+    assert {row["source_fid"] for row in items} == {100, 200}
+
+    storage.mark_cleanup_item_removed(items[0]["id"], True, "")
+    updated = storage.list_cleanup_items_by_ids(scan_id, [items[0]["id"]])[0]
+    assert updated["removed"] == 1
+    assert updated["remove_error"] == ""

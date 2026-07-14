@@ -26,6 +26,18 @@ _DEFAULT_HEADERS = {
     "Referer": "https://www.bilibili.com/",
 }
 
+_INVALID_TITLES = {"已失效视频", "已失效", "失效视频", ""}
+
+
+def _is_invalid_resource(m: dict) -> bool:
+    """attr 未置 bit0 但表现为失效的资源。
+
+    B站部分失效视频不会设置 attr bit0，而是把标题清空或替换为占位文本。
+    仅用 title 作为判据，避免误伤 upper/cover 字段缺失的正常资源。
+    """
+    title = (m.get("title") or "").strip()
+    return title in _INVALID_TITLES
+
 
 def _get_mixin_key(img_key: str, sub_key: str) -> str:
     img = img_key[:32]
@@ -246,6 +258,9 @@ class BilibiliClient:
                 if m.get("attr", 0) & 1:
                     skip_item(m, "attr_invalid", "失效视频", removable=True)
                     continue
+                if _is_invalid_resource(m):
+                    skip_item(m, "attr_invalid", "失效视频", removable=True)
+                    continue
                 if m.get("type", 2) != 2:
                     skip_item(m, "non_video_type", "非视频类型", removable=False)
                     continue
@@ -334,6 +349,9 @@ class BilibiliClient:
                 if m.get("attr", 0) & 1:
                     skip_item(m, "attr_invalid", "失效视频", removable=True)
                     continue
+                if _is_invalid_resource(m):
+                    skip_item(m, "attr_invalid", "失效视频", removable=True)
+                    continue
                 if not m.get("id"):
                     skip_item(m, "no_id", "无资源ID", removable=False)
                     continue
@@ -384,6 +402,73 @@ class BilibiliClient:
             pn += 1
             if sleep_seconds:
                 await asyncio.sleep(sleep_seconds)
+
+    async def get_folder_resource_page(
+        self,
+        fid: int,
+        page: int = 1,
+        page_size: int = 20,
+        storage=None,
+    ) -> dict:
+        """读取收藏夹指定页的原始资源，供只读列表展示。"""
+        self._require_login()
+        data = await self._wbi_get(
+            "/x/v3/fav/resource/list",
+            {"media_id": fid, "pn": page, "ps": page_size, "order": "mtime", "platform": "web"},
+            storage,
+        )
+        medias = data.get("medias") or []
+        info = data.get("info") or {}
+        total = int(info.get("media_count") or 0)
+        has_more = data.get("has_more")
+        if has_more is None:
+            has_more = page * page_size < total
+
+        items = []
+        for media in medias:
+            resource_id = int(media.get("id") or 0)
+            resource_type = int(media.get("type", 2) or 2)
+            invalid = bool(media.get("attr", 0) & 1) or _is_invalid_resource(media)
+            items.append({
+                "resource_id": resource_id,
+                "resource_type": resource_type,
+                "bvid": media.get("bvid", ""),
+                "title": media.get("title", ""),
+                "up_name": media.get("upper", {}).get("name", ""),
+                "cover_url": media.get("cover", ""),
+                "tname": media.get("tname", ""),
+                "raw_attr": int(media.get("attr", 0) or 0),
+                "status": "invalid" if invalid else "available",
+                "status_label": "已失效" if invalid else "可访问",
+            })
+        return {
+            "page": page,
+            "page_size": page_size,
+            "total": total,
+            "has_more": bool(has_more),
+            "items": items,
+        }
+
+    async def get_folder_resource_ids(self, fid: int, storage=None) -> list[dict]:
+        """返回收藏夹的完整资源键，包含详情接口不返回的权限资源。"""
+        self._require_login()
+        data = await self._wbi_get(
+            "/x/v3/fav/resource/ids",
+            {"media_id": fid, "platform": "web"},
+            storage,
+        )
+        items = data if isinstance(data, list) else []
+        result = []
+        for item in items:
+            resource_id = item.get("id")
+            if not resource_id:
+                continue
+            result.append({
+                "resource_id": resource_id,
+                "resource_type": item.get("type", 2),
+                "bvid": item.get("bvid") or item.get("bv_id") or "",
+            })
+        return result
 
     async def get_video_info(self, bvid: str) -> dict:
         self._require_login()

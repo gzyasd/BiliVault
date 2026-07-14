@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>BiBiTool</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath fill='%23007aff' d='M16 2l2.3 7.7L26 12l-7.7 2.3L16 22l-2.3-7.7L6 12l7.7-2.3L16 2zm8 17l1.2 3.8L29 24l-3.8 1.2L24 29l-1.2-3.8L19 24l3.8-1.2L24 19z'/%3E%3C/svg%3E">
 <style id="theme-vars">
 /*
  * Pinguo design tokens
@@ -513,14 +514,17 @@
 
 <section data-view="home">
   <div class="max-w-3xl mx-auto pt-12 pb-24 px-6">
-    <div class="flex items-center gap-4">
+    <div class="flex flex-wrap items-center gap-4">
       <div class="shrink-0 flex items-center justify-center w-10 h-10 rounded-xl" style="background: var(--brand-50);">
         <i data-lucide="folder-open" style="width:20px;height:20px;color:var(--brand-500);"></i>
       </div>
-      <div class="min-w-0">
+      <div class="min-w-0 flex-1">
         <h1 class="text-2xl font-bold tracking-tight" style="color: var(--foreground);">选择收藏夹</h1>
         <p class="mt-1 text-sm" style="color: var(--muted-foreground);">选择要分类的收藏夹，开始整理你的收藏条目</p>
       </div>
+      <button data-dom-id="open-cleanup" type="button" class="btn btn-secondary shrink-0">
+        <i data-lucide="scan-search" class="w-4 h-4"></i><span>检查失效内容</span>
+      </button>
     </div>
     <div data-dom-id="resume-session" class="mt-8" style="display:none;"></div>
     <div class="mt-8">
@@ -534,11 +538,102 @@
       </div>
       <p class="mt-2 text-xs" style="color: var(--muted-foreground);">快速模式仅用标题分类，完整模式额外拉取简介和标签</p>
     </div>
+    <div class="mt-6 py-4" style="border-top:1px solid var(--border);border-bottom:1px solid var(--border);">
+      <div class="flex items-center justify-between gap-4">
+        <span class="text-sm font-medium" style="color:var(--foreground);">分类精细度</span>
+        <span data-dom-id="category-limit-summary" class="text-xs tabular-nums" style="color:var(--muted-foreground);">最多 14 个分类</span>
+      </div>
+      <div class="mt-3 grid grid-cols-4 gap-1 p-1 rounded-lg" style="background:var(--background-200);">
+        <button data-dom-id="granularity-coarse" type="button" class="h-9 rounded-md text-xs font-medium" style="border:0;cursor:pointer;">粗略</button>
+        <button data-dom-id="granularity-balanced" type="button" class="h-9 rounded-md text-xs font-medium" style="border:0;cursor:pointer;">均衡</button>
+        <button data-dom-id="granularity-detailed" type="button" class="h-9 rounded-md text-xs font-medium" style="border:0;cursor:pointer;">精细</button>
+        <button data-dom-id="granularity-custom" type="button" class="h-9 rounded-md text-xs font-medium" style="border:0;cursor:pointer;">自定义</button>
+      </div>
+      <div data-dom-id="granularity-custom-panel" class="mt-3 flex items-center justify-end gap-2" style="display:none;">
+        <label for="granularity-custom-limit" class="text-xs" style="color:var(--muted-foreground);">最大分类数</label>
+        <input id="granularity-custom-limit" data-dom-id="granularity-custom-limit" type="number" min="3" max="50" step="1" value="14" class="h-9 w-24 rounded-lg px-3 text-sm tabular-nums" style="background:var(--card);border:1px solid var(--border);color:var(--foreground);">
+      </div>
+    </div>
     <div data-dom-id="folder-list" class="mt-6 flex flex-col gap-3"></div>
     <div class="sticky bottom-0 mt-6 py-4" style="background: color-mix(in srgb, var(--background-50) 88%, transparent); backdrop-filter: blur(10px);">
       <button data-dom-id="start-organize" type="button" class="btn btn-primary btn-lg w-full" disabled>
         <i data-lucide="sparkles" class="w-5 h-5"></i>
         <span>开始智能整理</span>
+      </button>
+    </div>
+  </div>
+</section>
+
+<section data-view="cleanup">
+  <div class="max-w-4xl mx-auto pt-8 pb-36 px-5 sm:px-6">
+    <header class="flex flex-wrap items-start gap-3">
+      <button data-dom-id="cleanup-back" type="button" class="btn btn-text shrink-0" style="width:40px;height:40px;padding:0;" aria-label="返回收藏夹列表">
+        <i data-lucide="arrow-left" class="w-5 h-5"></i>
+      </button>
+      <div class="min-w-0 flex-1 pt-1">
+        <h1 class="text-xl font-bold" style="color:var(--foreground);">失效内容清理</h1>
+        <p data-dom-id="cleanup-summary" class="mt-1 text-sm" style="color:var(--muted-foreground);">检查当前账号的全部收藏夹</p>
+      </div>
+      <button data-dom-id="cleanup-rescan" type="button" class="btn btn-secondary">
+        <i data-lucide="refresh-cw" class="w-4 h-4"></i><span>重新扫描</span>
+      </button>
+    </header>
+
+    <section data-dom-id="cleanup-progress" class="mt-6 p-5 rounded-lg" style="background:var(--background-100);border:1px solid var(--border);" aria-live="polite">
+      <div class="flex items-center justify-between gap-3">
+        <span data-dom-id="cleanup-progress-status" class="text-sm font-medium" style="color:var(--foreground);">准备扫描</span>
+        <span data-dom-id="cleanup-progress-percent" class="text-sm font-semibold tabular-nums" style="color:var(--brand-600);">0%</span>
+      </div>
+      <div class="mt-3 h-2 rounded-full overflow-hidden" style="background:var(--background-300);">
+        <div data-dom-id="cleanup-progress-bar" class="progress-fill h-full rounded-full" style="width:0%;"></div>
+      </div>
+      <div class="mt-4 grid grid-cols-3 gap-3 text-center">
+        <div><strong data-dom-id="cleanup-folders" class="block text-lg tabular-nums">0/0</strong><span class="text-xs" style="color:var(--muted-foreground);">收藏夹</span></div>
+        <div><strong data-dom-id="cleanup-resources" class="block text-lg tabular-nums">0</strong><span class="text-xs" style="color:var(--muted-foreground);">已检查资源</span></div>
+        <div><strong data-dom-id="cleanup-problems" class="block text-lg tabular-nums">0</strong><span class="text-xs" style="color:var(--muted-foreground);">发现问题</span></div>
+      </div>
+    </section>
+
+    <div data-dom-id="cleanup-error" class="mt-4" style="display:none;"></div>
+    <div data-dom-id="cleanup-filter-bar" class="mt-6 flex flex-wrap items-center gap-2"></div>
+    <div class="mt-4 flex flex-wrap items-center justify-between gap-3">
+      <span data-dom-id="cleanup-selection-summary" class="text-sm" style="color:var(--muted-foreground);">已选择 0 项</span>
+      <div class="flex items-center gap-2">
+        <button data-dom-id="cleanup-select-all" type="button" class="btn btn-text">全选</button>
+        <button data-dom-id="cleanup-select-none" type="button" class="btn btn-text">取消全选</button>
+      </div>
+    </div>
+    <div data-dom-id="cleanup-list" class="mt-4 flex flex-col gap-4"></div>
+  </div>
+  <div class="fixed bottom-0 left-0 right-0 z-20 backdrop-blur" style="background:color-mix(in srgb,var(--background-50) 88%,transparent);border-top:1px solid var(--border);">
+    <div class="max-w-4xl mx-auto px-5 sm:px-6 py-4 flex items-center justify-between gap-3">
+      <button data-dom-id="cleanup-cancel" type="button" class="btn btn-text" style="color:var(--state-error);display:none;">
+        <i data-lucide="x" class="w-4 h-4"></i><span>取消扫描</span>
+      </button>
+      <span data-dom-id="cleanup-remove-status" class="text-xs min-w-0 truncate" style="color:var(--muted-foreground);"></span>
+      <button data-dom-id="cleanup-remove" type="button" class="btn btn-primary" disabled>
+        <i data-lucide="trash-2" class="w-4 h-4"></i><span>删除选中项</span>
+      </button>
+    </div>
+  </div>
+</section>
+
+<section data-view="folder-resources">
+  <div class="max-w-3xl mx-auto pt-8 pb-20 px-5 sm:px-6">
+    <div class="flex items-start gap-3">
+      <button data-dom-id="folder-resources-back" type="button" class="btn btn-text shrink-0" style="width:40px;height:40px;padding:0;" aria-label="返回收藏夹列表">
+        <i data-lucide="arrow-left" class="w-5 h-5"></i>
+      </button>
+      <div class="min-w-0 flex-1 pt-1">
+        <h1 data-dom-id="folder-resources-title" class="text-xl font-bold truncate" style="color:var(--foreground);">收藏夹资源</h1>
+        <p data-dom-id="folder-resources-summary" class="mt-1 text-sm" style="color:var(--muted-foreground);">正在加载...</p>
+      </div>
+    </div>
+    <div data-dom-id="folder-resources-error" class="mt-6" style="display:none;"></div>
+    <div data-dom-id="folder-resources-list" class="mt-6 flex flex-col gap-3"></div>
+    <div class="mt-6 flex justify-center">
+      <button data-dom-id="folder-resources-load-more" type="button" class="btn btn-secondary" style="display:none;">
+        <i data-lucide="chevrons-down" class="w-4 h-4"></i><span>加载更多</span>
       </button>
     </div>
   </div>
@@ -576,7 +671,7 @@
 </section>
 
 <section data-view="review">
-  <div class="max-w-4xl mx-auto px-5 sm:px-6 pt-8 pb-32">
+  <div class="max-w-4xl mx-auto px-5 sm:px-6 pt-8 pb-48">
     <header class="mb-10 flex items-start gap-4">
       <div class="shrink-0 w-10 h-10 rounded-xl flex items-center justify-center" style="background: var(--brand-50);">
         <i data-lucide="layout-grid" class="w-5 h-5" style="color: var(--brand-500);"></i>
@@ -593,21 +688,46 @@
     <div data-dom-id="review-plan"></div>
   </div>
   <div class="fixed bottom-0 left-0 right-0 z-20 backdrop-blur" style="background: color-mix(in srgb, var(--background-50) 82%, transparent); border-top: 1px solid var(--border); box-shadow: var(--shadow-lg);">
-    <div class="max-w-4xl mx-auto px-5 sm:px-6 py-4 flex flex-col sm:flex-row items-center justify-between gap-3">
-      <div class="flex items-center gap-2 order-2 sm:order-1 min-w-0">
-        <i data-lucide="alert-triangle" class="w-4 h-4 shrink-0" style="color: var(--chart-3);"></i>
-        <p class="text-xs sm:truncate" style="color: var(--muted-foreground);">将创建新收藏夹并移动条目，此操作不可逆</p>
+    <div class="max-w-4xl mx-auto px-5 sm:px-6 py-4">
+      <div data-dom-id="review-actions" class="flex flex-col sm:flex-row items-center justify-between gap-3">
+        <div class="flex items-center gap-2 order-2 sm:order-1 min-w-0">
+          <i data-lucide="alert-triangle" class="w-4 h-4 shrink-0" style="color: var(--chart-3);"></i>
+          <p class="text-xs sm:truncate" style="color: var(--muted-foreground);">将创建新收藏夹并移动条目，此操作不可逆</p>
+        </div>
+        <div class="order-1 sm:order-2 shrink-0 flex items-center gap-2">
+          <button data-dom-id="review-back-home" type="button" class="btn btn-text">
+            <i data-lucide="home" class="w-4 h-4"></i><span>返回首页</span>
+          </button>
+          <button data-dom-id="review-abandon" type="button" class="btn btn-text" style="color: var(--state-error);">
+            <i data-lucide="trash-2" class="w-4 h-4"></i><span>放弃方案</span>
+          </button>
+          <button data-dom-id="execute-confirm" type="button" class="btn btn-primary btn-lg">
+            <i data-lucide="check" class="w-5 h-5"></i><span>确认执行</span>
+          </button>
+        </div>
       </div>
-      <div class="order-1 sm:order-2 shrink-0 flex items-center gap-2">
-        <button data-dom-id="review-back-home" type="button" class="btn btn-text">
-          <i data-lucide="home" class="w-4 h-4"></i><span>返回首页</span>
-        </button>
-        <button data-dom-id="review-abandon" type="button" class="btn btn-text" style="color: var(--state-error);">
-          <i data-lucide="trash-2" class="w-4 h-4"></i><span>放弃方案</span>
-        </button>
-        <button data-dom-id="execute-confirm" type="button" class="btn btn-primary btn-lg">
-          <i data-lucide="check" class="w-5 h-5"></i><span>确认执行</span>
-        </button>
+      <div data-dom-id="execution-progress" style="display:none;" aria-live="polite">
+        <div class="flex items-center justify-between gap-4">
+          <div class="flex items-center gap-2 min-w-0">
+            <i data-lucide="loader-circle" class="w-4 h-4 shrink-0 spin-slow" style="color:var(--brand-500);"></i>
+            <span data-dom-id="execution-status" class="text-sm font-medium truncate" style="color:var(--foreground);">准备执行</span>
+          </div>
+          <div class="flex items-center gap-3 shrink-0">
+            <span data-dom-id="execution-percent" class="text-sm font-semibold tabular-nums" style="color:var(--brand-600);">0%</span>
+            <button data-dom-id="execution-back-home" type="button" class="btn btn-text" style="height:32px;padding:0 8px;">
+              <i data-lucide="home" class="w-4 h-4"></i><span>后台运行</span>
+            </button>
+          </div>
+        </div>
+        <div class="mt-3 h-2 w-full overflow-hidden rounded-full" style="background:var(--background-200);">
+          <div data-dom-id="execution-progress-bar" class="progress-fill h-full rounded-full transition-[width] duration-300" style="width:0%;"></div>
+        </div>
+        <div class="mt-3 grid grid-cols-4 divide-x text-center" style="border-color:var(--border);">
+          <div><span data-dom-id="execution-total" class="block text-sm font-semibold tabular-nums">0</span><span class="text-xs" style="color:var(--muted-foreground);">总数</span></div>
+          <div><span data-dom-id="execution-processed" class="block text-sm font-semibold tabular-nums">0</span><span class="text-xs" style="color:var(--muted-foreground);">已处理</span></div>
+          <div><span data-dom-id="execution-success" class="block text-sm font-semibold tabular-nums" style="color:var(--state-success);">0</span><span class="text-xs" style="color:var(--muted-foreground);">成功</span></div>
+          <div><span data-dom-id="execution-failed" class="block text-sm font-semibold tabular-nums" style="color:var(--state-error);">0</span><span class="text-xs" style="color:var(--muted-foreground);">失败</span></div>
+        </div>
       </div>
     </div>
   </div>

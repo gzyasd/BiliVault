@@ -39,6 +39,7 @@ CREATE TABLE IF NOT EXISTS classify_sessions (
   source_fid INTEGER,
   status TEXT,
   mode TEXT,
+  category_limit INTEGER NOT NULL DEFAULT 14,
   account_id TEXT,
   created_at TEXT,
   updated_at TEXT,
@@ -157,6 +158,36 @@ CREATE TABLE IF NOT EXISTS classification_plan_items (
   executed INTEGER DEFAULT 0,
   PRIMARY KEY (version_id, resource_id, resource_type)
 );
+CREATE TABLE IF NOT EXISTS cleanup_scans (
+  scan_id TEXT PRIMARY KEY,
+  account_id TEXT NOT NULL,
+  status TEXT NOT NULL,
+  folders_total INTEGER DEFAULT 0,
+  folders_scanned INTEGER DEFAULT 0,
+  resources_scanned INTEGER DEFAULT 0,
+  problem_total INTEGER DEFAULT 0,
+  current_folder_title TEXT DEFAULT '',
+  error TEXT DEFAULT '',
+  created_at TEXT,
+  updated_at TEXT
+);
+CREATE TABLE IF NOT EXISTS cleanup_items (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  scan_id TEXT NOT NULL,
+  source_fid INTEGER NOT NULL,
+  source_title TEXT DEFAULT '',
+  resource_id INTEGER NOT NULL,
+  resource_type INTEGER DEFAULT 2,
+  bvid TEXT DEFAULT '',
+  title TEXT DEFAULT '',
+  problem_type TEXT NOT NULL,
+  problem_label TEXT DEFAULT '',
+  removed INTEGER DEFAULT 0,
+  remove_error TEXT DEFAULT '',
+  created_at TEXT,
+  updated_at TEXT,
+  UNIQUE (scan_id, source_fid, resource_id, resource_type)
+);
 """
 
 
@@ -215,6 +246,8 @@ class Storage:
         with self._conn() as conn:
             if self._has_table(conn, "classify_sessions") and not self._has_column(conn, "classify_sessions", "account_id"):
                 conn.execute("ALTER TABLE classify_sessions ADD COLUMN account_id TEXT")
+            if self._has_table(conn, "classify_sessions") and not self._has_column(conn, "classify_sessions", "category_limit"):
+                conn.execute("ALTER TABLE classify_sessions ADD COLUMN category_limit INTEGER NOT NULL DEFAULT 14")
             if self._has_table(conn, "fav_folders") and not self._has_column(conn, "fav_folders", "account_id"):
                 conn.execute("ALTER TABLE fav_folders ADD COLUMN account_id TEXT")
             if self._has_table(conn, "session_sources") and not self._has_column(conn, "session_sources", "account_id"):
@@ -565,13 +598,13 @@ class Storage:
             ).fetchall()
             return [dict(r) for r in rows]
 
-    def create_session(self, source_fid: int, mode: str) -> str:
+    def create_session(self, source_fid: int, mode: str, category_limit: int = 14) -> str:
         session_id = str(uuid.uuid4())
         with self._conn() as conn:
             conn.execute(
-                "INSERT INTO classify_sessions (session_id, source_fid, status, mode, account_id, created_at, updated_at, stats) "
-                "VALUES (?, ?, 'draft', ?, '', datetime('now'), datetime('now'), '{}')",
-                (session_id, source_fid, mode),
+                "INSERT INTO classify_sessions (session_id, source_fid, status, mode, category_limit, account_id, created_at, updated_at, stats) "
+                "VALUES (?, ?, 'draft', ?, ?, '', datetime('now'), datetime('now'), '{}')",
+                (session_id, source_fid, mode, category_limit),
             )
         return session_id
 
@@ -899,6 +932,94 @@ class Storage:
         with self._conn() as conn:
             conn.execute(
                 "UPDATE skipped_items SET removed = ?, remove_error = ?, updated_at = datetime('now') WHERE id = ?",
+                (1 if ok else 0, error, item_id),
+            )
+
+    def create_cleanup_scan(self, account_id: str, folders_total: int) -> str:
+        scan_id = str(uuid.uuid4())
+        with self._conn() as conn:
+            conn.execute(
+                "INSERT INTO cleanup_scans (scan_id, account_id, status, folders_total, created_at, updated_at) "
+                "VALUES (?, ?, 'queued', ?, datetime('now'), datetime('now'))",
+                (scan_id, account_id, folders_total),
+            )
+        return scan_id
+
+    def update_cleanup_scan(self, scan_id: str, **values) -> None:
+        allowed = {
+            "status", "folders_total", "folders_scanned", "resources_scanned",
+            "problem_total", "current_folder_title", "error",
+        }
+        updates = [(key, value) for key, value in values.items() if key in allowed]
+        if not updates:
+            return
+        assignments = ", ".join(f"{key} = ?" for key, _ in updates)
+        params = [value for _, value in updates]
+        with self._conn() as conn:
+            conn.execute(
+                f"UPDATE cleanup_scans SET {assignments}, updated_at = datetime('now') WHERE scan_id = ?",
+                [*params, scan_id],
+            )
+
+    def get_cleanup_scan(self, scan_id: str, account_id: str | None = None) -> dict | None:
+        with self._conn() as conn:
+            if account_id is None:
+                row = conn.execute("SELECT * FROM cleanup_scans WHERE scan_id = ?", (scan_id,)).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT * FROM cleanup_scans WHERE scan_id = ? AND account_id = ?",
+                    (scan_id, account_id),
+                ).fetchone()
+            return dict(row) if row else None
+
+    def get_latest_cleanup_scan(self, account_id: str) -> dict | None:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM cleanup_scans WHERE account_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                (account_id,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def add_cleanup_items(self, scan_id: str, items: list[dict]) -> None:
+        with self._conn() as conn:
+            for item in items:
+                conn.execute(
+                    "INSERT INTO cleanup_items (scan_id, source_fid, source_title, resource_id, resource_type, "
+                    "bvid, title, problem_type, problem_label, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now')) "
+                    "ON CONFLICT(scan_id, source_fid, resource_id, resource_type) DO UPDATE SET "
+                    "source_title=excluded.source_title, bvid=excluded.bvid, title=excluded.title, "
+                    "problem_type=excluded.problem_type, problem_label=excluded.problem_label, updated_at=datetime('now')",
+                    (
+                        scan_id, item["source_fid"], item.get("source_title", ""), item["resource_id"],
+                        item.get("resource_type", 2), item.get("bvid", ""), item.get("title", ""),
+                        item["problem_type"], item.get("problem_label", ""),
+                    ),
+                )
+
+    def list_cleanup_items(self, scan_id: str) -> list[dict]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM cleanup_items WHERE scan_id = ? ORDER BY source_fid, id",
+                (scan_id,),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def list_cleanup_items_by_ids(self, scan_id: str, item_ids: list[int]) -> list[dict]:
+        if not item_ids:
+            return []
+        placeholders = ",".join("?" for _ in item_ids)
+        with self._conn() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM cleanup_items WHERE scan_id = ? AND id IN ({placeholders}) ORDER BY id",
+                [scan_id, *item_ids],
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def mark_cleanup_item_removed(self, item_id: int, ok: bool, error: str = "") -> None:
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE cleanup_items SET removed = ?, remove_error = ?, updated_at = datetime('now') WHERE id = ?",
                 (1 if ok else 0, error, item_id),
             )
 

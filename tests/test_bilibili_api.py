@@ -283,6 +283,135 @@ async def test_get_folder_video_pages_returns_skipped_items(client, monkeypatch)
 
 
 @respx.mock
+async def test_get_folder_resource_pages_detects_invalid_by_empty_title(client, monkeypatch):
+    """attr=0 但 title 为空 → 视为失效并跳过。"""
+    monkeypatch.setattr(client, "cookies", {"SESSDATA": "abc", "DedeUserID": "1", "bili_jct": "x"})
+    monkeypatch.setattr("core.bilibili_api._time_now", lambda: 1700000000)
+    respx.get(f"{API_BASE}/x/web-interface/nav").mock(return_value=httpx.Response(200, json={
+        "code": 0, "data": {"wbi_img": {"img_url": "https://x/7cd088941d418c9b7d4932caff0ff715.png", "sub_url": "https://x/e3a47cd088941d418c9b7d4932caff0f.png"}},
+    }))
+    respx.get(f"{API_BASE}/x/v3/fav/resource/list").mock(return_value=httpx.Response(200, json={
+        "code": 0,
+        "data": {"info": {"media_count": 2}, "medias": [
+            {"id": 1, "bvid": "BV1", "title": "有效视频", "upper": {"name": "U"}, "cover": "", "attr": 0, "type": 2, "tname": "科技"},
+            {"id": 2, "bvid": "", "title": "", "upper": {"name": "U"}, "cover": "", "attr": 0, "type": 2, "tname": "科技"},
+        ], "has_more": False},
+    }))
+    pages = []
+    async for p in client.get_folder_resource_pages(fid=100, storage=None, page_size=20, sleep_seconds=0):
+        pages.append(p)
+    assert pages[0]["usable_count"] == 1
+    assert pages[0]["skipped_count"] == 1
+    assert pages[0]["skipped_items"][0]["avid"] == 2
+    assert pages[0]["skipped_items"][0]["reason_code"] == "attr_invalid"
+    assert pages[0]["skipped_items"][0]["removable"] is True
+
+
+@respx.mock
+async def test_get_folder_resource_pages_detects_invalid_by_placeholder_title(client, monkeypatch):
+    """attr=0 但 title 为 '已失效视频' 占位文本 → 视为失效并跳过。"""
+    monkeypatch.setattr(client, "cookies", {"SESSDATA": "abc", "DedeUserID": "1", "bili_jct": "x"})
+    monkeypatch.setattr("core.bilibili_api._time_now", lambda: 1700000000)
+    respx.get(f"{API_BASE}/x/web-interface/nav").mock(return_value=httpx.Response(200, json={
+        "code": 0, "data": {"wbi_img": {"img_url": "https://x/7cd088941d418c9b7d4932caff0ff715.png", "sub_url": "https://x/e3a47cd088941d418c9b7d4932caff0f.png"}},
+    }))
+    respx.get(f"{API_BASE}/x/v3/fav/resource/list").mock(return_value=httpx.Response(200, json={
+        "code": 0,
+        "data": {"info": {"media_count": 2}, "medias": [
+            {"id": 1, "bvid": "BV1", "title": "正常视频", "upper": {"name": "U"}, "cover": "", "attr": 0, "type": 2, "tname": "科技"},
+            {"id": 2, "bvid": "", "title": "已失效视频", "upper": {"name": "U"}, "cover": "", "attr": 0, "type": 2, "tname": "科技"},
+        ], "has_more": False},
+    }))
+    pages = []
+    async for p in client.get_folder_resource_pages(fid=100, storage=None, page_size=20, sleep_seconds=0):
+        pages.append(p)
+    assert pages[0]["usable_count"] == 1
+    assert pages[0]["skipped_items"][0]["avid"] == 2
+    assert pages[0]["skipped_items"][0]["reason_code"] == "attr_invalid"
+    assert pages[0]["skipped_items"][0]["title"] == "已失效视频"
+
+
+@respx.mock
+async def test_get_folder_resource_pages_keeps_normal_video_without_upper_mid(client, monkeypatch):
+    """attr=0、title 正常、upper 无 mid → 不应误判为失效（验证不误伤）。"""
+    monkeypatch.setattr(client, "cookies", {"SESSDATA": "abc", "DedeUserID": "1", "bili_jct": "x"})
+    monkeypatch.setattr("core.bilibili_api._time_now", lambda: 1700000000)
+    respx.get(f"{API_BASE}/x/web-interface/nav").mock(return_value=httpx.Response(200, json={
+        "code": 0, "data": {"wbi_img": {"img_url": "https://x/7cd088941d418c9b7d4932caff0ff715.png", "sub_url": "https://x/e3a47cd088941d418c9b7d4932caff0f.png"}},
+    }))
+    respx.get(f"{API_BASE}/x/v3/fav/resource/list").mock(return_value=httpx.Response(200, json={
+        "code": 0,
+        "data": {"info": {"media_count": 1}, "medias": [
+            {"id": 1, "bvid": "BV1", "title": "正常标题", "upper": {"name": "U"}, "cover": "", "attr": 0, "type": 2, "tname": "科技"},
+        ], "has_more": False},
+    }))
+    pages = []
+    async for p in client.get_folder_resource_pages(fid=100, storage=None, page_size=20, sleep_seconds=0):
+        pages.append(p)
+    assert pages[0]["usable_count"] == 1
+    assert pages[0]["skipped_count"] == 0
+    assert pages[0]["resources"][0]["avid"] == 1
+    assert pages[0]["resources"][0]["title"] == "正常标题"
+
+
+@respx.mock
+async def test_get_folder_resource_pages_keeps_non_video_with_normal_title(client, monkeypatch):
+    """attr=0、title 正常、type=11 合集 → 不应误判为失效（验证不误伤非视频正常资源）。"""
+    monkeypatch.setattr(client, "cookies", {"SESSDATA": "abc", "DedeUserID": "1", "bili_jct": "x"})
+    monkeypatch.setattr("core.bilibili_api._time_now", lambda: 1700000000)
+    respx.get(f"{API_BASE}/x/web-interface/nav").mock(return_value=httpx.Response(200, json={
+        "code": 0, "data": {"wbi_img": {"img_url": "https://x/7cd088941d418c9b7d4932caff0ff715.png", "sub_url": "https://x/e3a47cd088941d418c9b7d4932caff0f.png"}},
+    }))
+    respx.get(f"{API_BASE}/x/v3/fav/resource/list").mock(return_value=httpx.Response(200, json={
+        "code": 0,
+        "data": {"info": {"media_count": 1}, "medias": [
+            {"id": 1, "bvid": "", "title": "合集标题", "upper": {"name": "U"}, "cover": "", "attr": 0, "type": 11, "tname": "合集"},
+        ], "has_more": False},
+    }))
+    pages = []
+    async for p in client.get_folder_resource_pages(fid=100, storage=None, page_size=20, sleep_seconds=0):
+        pages.append(p)
+    assert pages[0]["usable_count"] == 1
+    assert pages[0]["skipped_count"] == 0
+    assert pages[0]["resources"][0]["resource_type"] == 11
+    assert pages[0]["resources"][0]["title"] == "合集标题"
+
+
+@pytest.mark.asyncio
+async def test_get_folder_resource_page_reads_requested_page_and_keeps_display_states(client, monkeypatch):
+    monkeypatch.setattr(client, "cookies", {"SESSDATA": "abc", "DedeUserID": "1", "bili_jct": "x"})
+    captured = {}
+
+    async def fake_wbi_get(path, params, storage):
+        captured["path"] = path
+        captured["params"] = params
+        return {
+            "info": {"media_count": 60},
+            "medias": [
+                {"id": 1, "bvid": "BV1", "title": "正常视频", "upper": {"name": "UP1"}, "cover": "c1", "attr": 0, "type": 2, "tname": "科技"},
+                {"id": 2, "bvid": "BV2", "title": "已失效视频", "upper": {"name": ""}, "cover": "", "attr": 1, "type": 2, "tname": ""},
+                {"id": 3, "bvid": "", "title": "正常合集", "upper": {"name": "UP3"}, "cover": "c3", "attr": 0, "type": 11, "tname": "合集"},
+            ],
+            "has_more": True,
+        }
+
+    monkeypatch.setattr(client, "_wbi_get", fake_wbi_get)
+
+    result = await client.get_folder_resource_page(100, page=2, page_size=20, storage=None)
+
+    assert captured["path"] == "/x/v3/fav/resource/list"
+    assert captured["params"]["pn"] == 2
+    assert captured["params"]["ps"] == 20
+    assert result["total"] == 60
+    assert result["has_more"] is True
+    assert [(item["resource_id"], item["resource_type"], item["status"]) for item in result["items"]] == [
+        (1, 2, "available"),
+        (2, 2, "invalid"),
+        (3, 11, "available"),
+    ]
+
+
+@respx.mock
 async def test_get_folder_videos_paginated(client, monkeypatch):
     monkeypatch.setattr(client, "cookies", {"SESSDATA": "abc", "DedeUserID": "1", "bili_jct": "x"})
     monkeypatch.setattr("core.bilibili_api._time_now", lambda: 1700000000)
@@ -425,3 +554,30 @@ async def test_delete_folders(client, monkeypatch):
     form = route.calls[0].request.content.decode()
     assert "media_ids=100%2C200" in form
     assert "csrf=csrf_tok" in form
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_get_folder_resource_ids_normalizes_resource_keys(client, monkeypatch):
+    monkeypatch.setattr(client, "cookies", {"SESSDATA": "abc", "DedeUserID": "1"})
+    monkeypatch.setattr("core.bilibili_api._time_now", lambda: 1700000000)
+    respx.get(f"{API_BASE}/x/web-interface/nav").mock(return_value=httpx.Response(200, json={
+        "code": 0,
+        "data": {"wbi_img": {
+            "img_url": "https://x/7cd088941d418c9b7d4932caff0ff715.png",
+            "sub_url": "https://x/e3a47cd088941d418c9b7d4932caff0f.png",
+        }},
+    }))
+    respx.get(f"{API_BASE}/x/v3/fav/resource/ids").mock(return_value=httpx.Response(200, json={
+        "code": 0,
+        "data": [
+            {"id": 101, "type": 2, "bvid": "BV1visible"},
+            {"id": 202, "type": 11, "bv_id": ""},
+            {"id": 0, "type": 2, "bvid": "BV1ignore"},
+        ],
+    }))
+
+    assert await client.get_folder_resource_ids(100, storage=None) == [
+        {"resource_id": 101, "resource_type": 2, "bvid": "BV1visible"},
+        {"resource_id": 202, "resource_type": 11, "bvid": ""},
+    ]

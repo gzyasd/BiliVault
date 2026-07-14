@@ -19,6 +19,7 @@ def deps(tmp_path):
     bili.account_id = ""
     # 默认让 collect() 回退到 get_folder_video_pages；需要测试 resource_pages 的用例自行覆盖
     bili.get_folder_resource_pages = None
+    bili.get_folder_resource_ids = AsyncMock(return_value=[])
     bili.get_my_folders = AsyncMock(return_value=[
         {"fid": 100, "title": "默认收藏夹", "media_count": 0, "cover_url": "", "fav_state": 1},
         {"fid": 200, "title": "舞蹈", "media_count": 0, "cover_url": "", "fav_state": 0},
@@ -122,7 +123,7 @@ async def test_session_full_mode_enriches_video_before_classification(deps):
     })
     captured_videos = []
 
-    async def fake_classify(videos, batch_size=50, on_progress=None):
+    async def fake_classify(videos, batch_size=50, on_progress=None, max_categories=14):
         captured_videos.extend(videos)
         return [Classification(1, "编程", 0.9, "")]
     ai.classify = fake_classify
@@ -148,6 +149,16 @@ async def test_session_resume_pending(deps):
     resumable = session.list_resumable()
     assert len(resumable) == 1
     assert resumable[0]["session_id"] == sid
+
+
+@pytest.mark.asyncio
+async def test_create_many_persists_category_limit(deps):
+    storage, bili, ai = deps
+    session = ClassifySession(storage, bili, ai)
+
+    sid = await session.create_many([100], "quick", category_limit=8)
+
+    assert storage.load_session(sid)["category_limit"] == 8
 
 
 @pytest.mark.asyncio
@@ -209,6 +220,70 @@ async def test_session_execute_records_create_folder_failure(deps):
     assert [it["avid"] for it in failed] == [1, 2]
     assert all(it["target_fid"] == 0 for it in failed)
     bili.move_resources.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_execute_emits_progress_after_each_move_batch(deps):
+    storage, bili, ai = deps
+    sid = storage.create_session(source_fid=100, mode="quick")
+    storage.update_session_status(sid, "pending_review")
+    storage.save_classifications(sid, [
+        {"avid": 1, "category": "Programming", "confidence": 0.9, "reason": ""},
+        {"avid": 2, "category": "Programming", "confidence": 0.8, "reason": ""},
+    ])
+    bili.create_folder = AsyncMock(return_value=5001)
+    bili.move_resources = AsyncMock(return_value=True)
+    events = []
+
+    session = ClassifySession(storage, bili, ai)
+    stats = await session.execute(sid, batch_size=1, on_progress=events.append)
+
+    moving = [
+        event for event in events
+        if event.get("stage") == "executing"
+        and event.get("phase") == "moving"
+        and event.get("processed", 0) > 0
+    ]
+    assert [event["processed"] for event in moving] == [1, 2]
+    assert moving[-1] == {
+        "stage": "executing",
+        "phase": "moving",
+        "progress": 1.0,
+        "processed": 2,
+        "total": 2,
+        "success": 2,
+        "failed": 0,
+        "folders_created": 1,
+        "folders_total": 1,
+        "category": "Programming",
+        "source_fid": 100,
+    }
+    assert stats == {"success": 2, "failed": 0, "total": 2}
+
+
+@pytest.mark.asyncio
+async def test_execute_progress_counts_folder_creation_failures(deps):
+    storage, bili, ai = deps
+    sid = storage.create_session(source_fid=100, mode="quick")
+    storage.update_session_status(sid, "pending_review")
+    storage.save_classifications(sid, [
+        {"avid": 1, "category": "Programming", "confidence": 0.9, "reason": ""},
+        {"avid": 2, "category": "Programming", "confidence": 0.8, "reason": ""},
+    ])
+    bili.create_folder = AsyncMock(side_effect=BiliApiError(-403, "blocked"))
+    bili.move_resources = AsyncMock()
+    events = []
+
+    session = ClassifySession(storage, bili, ai)
+    stats = await session.execute(sid, on_progress=events.append)
+
+    executing = [event for event in events if event.get("stage") == "executing"]
+    assert executing[-1]["processed"] == 2
+    assert executing[-1]["total"] == 2
+    assert executing[-1]["success"] == 0
+    assert executing[-1]["failed"] == 2
+    assert executing[-1]["progress"] == 1.0
+    assert stats == {"success": 0, "failed": 2, "total": 2}
 
 
 @pytest.mark.asyncio
@@ -855,7 +930,7 @@ async def test_classify_emits_batch_progress(deps):
 
     classifier = AiClassifier(base_url="http://x", api_key="k", model="m")
 
-    async def classify_batch(videos):
+    async def classify_batch(videos, max_categories=14):
         return [Classification(v.avid, "动画", 0.9, "测试") for v in videos]
 
     classifier.classify_batch = classify_batch
@@ -890,8 +965,9 @@ async def test_classify_uses_configured_ai_batch_size(deps):
 
     seen = {}
 
-    async def classify(videos, batch_size=50, on_progress=None):
+    async def classify(videos, batch_size=50, on_progress=None, max_categories=14):
         seen["batch_size"] = batch_size
+        seen["max_categories"] = max_categories
         if on_progress:
             await on_progress({"stage": "classifying", "progress": 1.0, "classified": len(videos), "total": len(videos)})
         return [Classification(v.avid, "动画", 0.9, "测试") for v in videos]
@@ -901,6 +977,111 @@ async def test_classify_uses_configured_ai_batch_size(deps):
     await ClassifySession(storage, bili, ai).classify(sid, on_progress=lambda e: None)
 
     assert seen["batch_size"] == 120
+
+
+@pytest.mark.asyncio
+async def test_classify_uses_session_category_limit(deps):
+    storage, bili, ai = deps
+    sid = storage.create_session(source_fid=100, mode="quick", category_limit=8)
+    storage.update_session_status(sid, "classifying")
+    storage.upsert_video({
+        "avid": 1, "bvid": "BV1", "title": "条目1", "intro": "", "tags": "[]",
+        "up_name": "UP", "up_mid": 1, "cover_url": "", "tname": "动画", "fid": 100,
+    })
+    storage.add_session_video_source(sid, resource_id=1, source_fid=100)
+    seen = {}
+
+    async def classify(videos, batch_size=50, on_progress=None, max_categories=14):
+        seen["max_categories"] = max_categories
+        return [Classification(1, "动画", 0.9, "")]
+
+    ai.classify = classify
+    await ClassifySession(storage, bili, ai).classify(sid)
+
+    assert seen["max_categories"] == 8
+
+
+@pytest.mark.asyncio
+async def test_refine_plan_uses_session_category_limit(deps):
+    storage, bili, ai = deps
+    sid = storage.create_session(source_fid=100, mode="quick", category_limit=8)
+    storage.update_session_status(sid, "pending_review")
+    storage.upsert_video({
+        "avid": 1, "bvid": "BV1", "title": "条目1", "intro": "", "tags": "[]",
+        "up_name": "UP", "up_mid": 1, "cover_url": "", "tname": "动画", "fid": 100,
+    })
+    storage.create_plan_version(sid, None, "初始分类", [{
+        "avid": 1, "resource_id": 1, "resource_type": 2,
+        "category": "动画", "confidence": 0.9, "reason": "",
+    }], activate=True)
+    seen = {}
+
+    async def refine_plan(videos, current, instruction, max_categories=14, batch_size=100, on_progress=None):
+        seen["max_categories"] = max_categories
+        seen["batch_size"] = batch_size
+        if on_progress:
+            await on_progress({"stage": "refining", "processed": 1, "total": 1, "progress": 1.0, "retry_count": 0})
+        return current
+
+    ai.refine_plan = refine_plan
+    await ClassifySession(storage, bili, ai).refine_plan(sid, "保持不变")
+
+    assert seen["max_categories"] == 8
+    assert seen["batch_size"] == 100
+
+
+@pytest.mark.asyncio
+async def test_refine_plan_forwards_progress_and_emits_saving(deps):
+    storage, bili, ai = deps
+    sid = storage.create_session(source_fid=100, mode="quick")
+    storage.update_session_status(sid, "pending_review")
+    storage.upsert_video({
+        "avid": 1, "bvid": "BV1", "title": "条目1", "intro": "", "tags": "[]",
+        "up_name": "UP", "up_mid": 1, "cover_url": "", "tname": "动画", "fid": 100,
+    })
+    storage.create_plan_version(sid, None, "初始分类", [{
+        "avid": 1, "resource_id": 1, "resource_type": 2,
+        "category": "动画", "confidence": 0.9, "reason": "",
+    }], activate=True)
+
+    async def refine(videos, current, instruction, max_categories=14, batch_size=100, on_progress=None):
+        await on_progress({"stage": "refining", "processed": 1, "total": 1, "progress": 1.0, "retry_count": 2})
+        return [Classification(1, "官方作品", 0.95, "官方", resource_type=2)]
+
+    ai.refine_plan = refine
+    events = []
+    result = await ClassifySession(storage, bili, ai).refine_plan(sid, "官方单独分类", on_progress=events.append)
+
+    assert [event["stage"] for event in events] == ["refining", "saving"]
+    assert events[-1]["retry_count"] == 2
+    assert result["items"][0]["category"] == "官方作品"
+
+
+@pytest.mark.asyncio
+async def test_retry_unclassified_only_updates_unclassified_items(deps):
+    storage, bili, ai = deps
+    sid = storage.create_session(source_fid=100, mode="quick")
+    storage.update_session_status(sid, "pending_review")
+    for avid in (1, 2):
+        storage.upsert_video({
+            "avid": avid, "bvid": f"BV{avid}", "title": f"条目{avid}", "intro": "", "tags": "[]",
+            "up_name": "UP", "up_mid": 1, "cover_url": "", "tname": "动画", "fid": 100,
+        })
+    storage.create_plan_version(sid, None, "初始分类", [
+        {"avid": 1, "resource_id": 1, "resource_type": 2, "category": "未分类", "confidence": 0, "reason": "AI解析失败"},
+        {"avid": 2, "resource_id": 2, "resource_type": 2, "category": "动画", "confidence": 0.9, "reason": "原分类"},
+    ], activate=True)
+    ai.classify = AsyncMock(return_value=[Classification(1, "编程", 0.9, "重试成功", resource_type=2)])
+
+    result = await ClassifySession(storage, bili, ai).retry_unclassified(sid)
+
+    assert result["recovered"] == 1
+    assert result["remaining"] == 0
+    categories = {item["resource_id"]: item["category"] for item in result["plan"]["items"]}
+    assert categories == {1: "编程", 2: "动画"}
+    assert len(storage.list_plan_versions(sid)) == 2
+    classified_videos = ai.classify.await_args.args[0]
+    assert [video.avid for video in classified_videos] == [1]
 
 
 @pytest.mark.asyncio
@@ -1023,7 +1204,7 @@ async def test_classify_distinguishes_same_resource_id_different_type(deps):
     storage.add_session_video_source(sid, resource_id=123, source_fid=100, resource_type=2)
     storage.add_session_video_source(sid, resource_id=123, source_fid=100, resource_type=11)
 
-    async def classify(videos, batch_size=50, on_progress=None):
+    async def classify(videos, batch_size=50, on_progress=None, max_categories=14):
         return [
             Classification(v.avid, f"类型{v.resource_type}", 0.9, "", resource_type=v.resource_type)
             for v in videos
@@ -1060,7 +1241,7 @@ async def test_classify_does_not_include_cached_same_id_other_type(deps):
 
     seen = []
 
-    async def classify(videos, batch_size=50, on_progress=None):
+    async def classify(videos, batch_size=50, on_progress=None, max_categories=14):
         seen.extend((v.avid, v.resource_type) for v in videos)
         return [Classification(v.avid, "视频类", 0.9, "", resource_type=v.resource_type) for v in videos]
 
@@ -1071,3 +1252,84 @@ async def test_classify_does_not_include_cached_same_id_other_type(deps):
     active = storage.get_active_plan_version(sid)
     items = storage.load_plan_items(active["version_id"])
     assert [(it["resource_id"], it["resource_type"]) for it in items] == [(123, 2)]
+
+
+@pytest.mark.asyncio
+async def test_collect_records_detail_hidden_resources_and_skips_ai(deps):
+    storage, bili, ai = deps
+
+    async def empty_pages(fid, storage=None):
+        yield {
+            "page": 1, "videos": [], "resources": [], "raw_count": 0,
+            "usable_count": 0, "skipped_count": 0, "skipped_reasons": {},
+            "skipped_items": [], "expected_total": 2, "has_more": False,
+        }
+
+    bili.get_folder_resource_pages = empty_pages
+    bili.get_folder_resource_ids = AsyncMock(return_value=[
+        {"resource_id": 11, "resource_type": 2, "bvid": "BV1hiddenA"},
+        {"resource_id": 12, "resource_type": 2, "bvid": "BV1hiddenB"},
+    ])
+    ai.classify = AsyncMock()
+
+    session = ClassifySession(storage, bili, ai)
+    sid = await session.create(100, "quick")
+    await session.run_pipeline(sid)
+
+    skipped = storage.list_skipped_items(sid)
+    assert [(item["avid"], item["bvid"], item["reason_code"], item["removable"]) for item in skipped] == [
+        (11, "BV1hiddenA", "inaccessible", 1),
+        (12, "BV1hiddenB", "inaccessible", 1),
+    ]
+    assert storage.load_session(sid)["status"] == "pending_review"
+    ai.classify.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_collect_classifies_visible_resource_and_skips_only_missing_id(deps):
+    storage, bili, ai = deps
+
+    async def partial_pages(fid, storage=None):
+        yield {
+            "page": 1, "videos": [],
+            "resources": [{
+                "resource_id": 11, "resource_type": 2, "avid": 11,
+                "bvid": "BV1visible", "title": "可见", "intro": "", "tags": "[]",
+                "up_name": "UP", "up_mid": 1, "cover_url": "", "tname": "", "fid": fid,
+            }],
+            "raw_count": 1, "usable_count": 1, "skipped_count": 0,
+            "skipped_reasons": {}, "skipped_items": [], "expected_total": 2, "has_more": False,
+        }
+
+    bili.get_folder_resource_pages = partial_pages
+    bili.get_folder_resource_ids = AsyncMock(return_value=[
+        {"resource_id": 11, "resource_type": 2, "bvid": "BV1visible"},
+        {"resource_id": 12, "resource_type": 2, "bvid": "BV1hidden"},
+    ])
+    ai.classify = AsyncMock(return_value=[Classification(11, "分类", 0.9, "")])
+
+    session = ClassifySession(storage, bili, ai)
+    sid = await session.create(100, "quick")
+    await session.run_pipeline(sid)
+
+    assert [item["resource_id"] for item in storage.load_classifications(sid)] == [11]
+    assert [item["avid"] for item in storage.list_skipped_items(sid)] == [12]
+    ai.classify.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_classify_empty_session_never_uses_fid_cache_or_calls_ai(deps):
+    storage, bili, ai = deps
+    storage.upsert_video({
+        "avid": 999, "bvid": "BV1cached", "title": "历史缓存", "intro": "", "tags": "[]",
+        "up_name": "UP", "up_mid": 1, "cover_url": "", "tname": "", "fid": 100,
+    })
+    sid = storage.create_session(source_fid=100, mode="quick")
+    storage.update_session_status(sid, "classifying")
+    ai.classify = AsyncMock()
+
+    await ClassifySession(storage, bili, ai).classify(sid)
+
+    assert storage.load_classifications(sid) == []
+    assert storage.load_session(sid)["status"] == "pending_review"
+    ai.classify.assert_not_awaited()

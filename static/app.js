@@ -7,11 +7,25 @@ let qrPollToken = 0;
 let lastStableView = 'home';
 let activeReviewFilter = 'ALL';
 let isExecuting = false;
+let categoryLimit = 14;
+let categoryGranularity = 'balanced';
+const CATEGORY_LIMIT_PRESETS = { coarse: 8, balanced: 14, detailed: 24 };
+let folderResourceState = null;
 const collapsedReviewGroups = new Set();
 const selectedSourceFids = new Set();
 let skippedPanelCollapsed = false;
 const collapsedSkippedReasons = new Set();
 let cachedSkippedItems = null;
+let activeRefineJob = null;
+let lastRefineInstruction = '';
+let refineNotice = '';
+const cleanupState = {
+  scan: null,
+  items: [],
+  filter: 'all',
+  selected: new Set(),
+  collapsedFolders: new Set(),
+};
 
 function escapeHtml(value) {
   const map = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
@@ -170,13 +184,42 @@ async function renderHome() {
         <div data-role="folder-check" class="shrink-0 items-center justify-center w-6 h-6 rounded-full" style="background:var(--brand-500);color:var(--primary-foreground);display:none;">
           <i data-lucide="check" class="w-4 h-4"></i>
         </div>
-        <i data-lucide="chevron-right" class="shrink-0" style="width:18px;height:18px;color:var(--icon-300);"></i>
+        ${Number(f.media_count) === 0 && Number(f.fav_state) !== 1 ? `
+          <button data-dom-id="delete-empty-folder-${f.fid}" type="button" class="btn btn-text shrink-0" style="width:36px;height:36px;padding:0;color:var(--state-error);" aria-label="删除空收藏夹：${escapeHtml(f.title)}" title="删除空收藏夹">
+            <i data-lucide="trash-2" class="w-4 h-4"></i>
+          </button>` : ''}
+        <button data-dom-id="view-folder-resources-${f.fid}" type="button" class="btn btn-text shrink-0" style="width:36px;height:36px;padding:0;" aria-label="查看收藏夹资源：${escapeHtml(f.title)}" title="查看资源">
+          <i data-lucide="chevron-right" class="w-[18px] h-[18px]" style="color:var(--icon-300);"></i>
+        </button>
       </div>`).join('') || '<p style="color:var(--muted-foreground);">暂无收藏夹</p>';
 
     data.folders.forEach(f => {
       $(`select-folder-${f.fid}`).onclick = () => toggleFolderSelection(f.fid);
+      const viewButton = $(`view-folder-resources-${f.fid}`);
+      if (viewButton) {
+        viewButton.onclick = event => {
+          event.stopPropagation();
+          openFolderResources(f.fid, f.title, f.media_count);
+        };
+      }
+      if (Number(f.media_count) === 0 && Number(f.fav_state) !== 1) {
+        const deleteButton = $(`delete-empty-folder-${f.fid}`);
+        if (deleteButton) {
+          deleteButton.onclick = event => deleteEmptyFolder(event, f.fid, f.title);
+        }
+      }
     });
     if (window.lucide) lucide.createIcons();
+
+    Object.keys(CATEGORY_LIMIT_PRESETS).forEach(name => {
+      $(`granularity-${name}`).onclick = () => setCategoryGranularity(name);
+    });
+    $('granularity-custom').onclick = () => setCategoryGranularity('custom');
+    $('granularity-custom-limit').oninput = () => {
+      if (categoryGranularity === 'custom') updateCustomCategoryLimit();
+    };
+    $('granularity-custom-limit').onblur = () => updateCustomCategoryLimit(true);
+    setCategoryGranularity(categoryGranularity);
 
     $('start-organize').onclick = () => {
       if (!selectedSourceFids.size) return;
@@ -185,6 +228,7 @@ async function renderHome() {
 
     $('mode-quick').onclick = () => setMode('quick');
     $('mode-full').onclick = () => setMode('full');
+    $('open-cleanup').onclick = openCleanup;
   } catch (e) {
     if (e.code === 'NOT_LOGGED_IN') {
       showView('login');
@@ -192,6 +236,466 @@ async function renderHome() {
       return;
     }
     alert(e.message);
+  }
+}
+
+async function deleteEmptyFolder(event, fid, title) {
+  event.stopPropagation();
+  if (!confirm(`确认删除空收藏夹“${title}”？此操作不可逆。`)) return;
+
+  const button = $(`delete-empty-folder-${fid}`);
+  const originalHtml = button ? button.innerHTML : '';
+  if (button) {
+    button.disabled = true;
+    button.innerHTML = '<i data-lucide="loader-circle" class="w-4 h-4 spin-slow"></i>';
+    if (window.lucide) lucide.createIcons();
+  }
+  try {
+    await api(`/api/folders/${fid}`, { method: 'DELETE' });
+    selectedSourceFids.delete(Number(fid));
+    await renderHome();
+  } catch (error) {
+    if (button) {
+      button.disabled = false;
+      button.innerHTML = originalHtml;
+      if (window.lucide) lucide.createIcons();
+    }
+    alert(error.message);
+  }
+}
+
+function cleanupIsRunning() {
+  return cleanupState.scan && ['queued', 'scanning', 'removing'].includes(cleanupState.scan.status);
+}
+
+function cleanupVisibleItems() {
+  return cleanupState.items.filter(item => (
+    cleanupState.filter === 'all' || item.problem_type === cleanupState.filter
+  ));
+}
+
+function setCleanupData(data, defaultSelect = false) {
+  const previousScanId = cleanupState.scan && cleanupState.scan.scan_id;
+  cleanupState.scan = data.scan || null;
+  cleanupState.items = data.items || [];
+  const scanChanged = cleanupState.scan && cleanupState.scan.scan_id !== previousScanId;
+  if (defaultSelect || scanChanged) {
+    cleanupState.selected = new Set(
+      cleanupState.items.filter(item => !item.removed).map(item => Number(item.id)),
+    );
+    cleanupState.collapsedFolders.clear();
+    cleanupState.filter = 'all';
+  } else {
+    const selectableIds = new Set(cleanupState.items.filter(item => !item.removed).map(item => Number(item.id)));
+    cleanupState.selected = new Set([...cleanupState.selected].filter(id => selectableIds.has(id)));
+  }
+}
+
+function updateCleanupProgress(event = {}) {
+  const scan = cleanupState.scan || {};
+  const stage = event.stage || scan.status || 'queued';
+  const isRemoval = stage === 'removing' || scan.status === 'removing';
+  const rawProgress = event.progress != null
+    ? Number(event.progress)
+    : (scan.folders_total ? Number(scan.folders_scanned || 0) / Number(scan.folders_total) : 0);
+  const percent = Math.max(0, Math.min(100, Math.round(rawProgress <= 1 ? rawProgress * 100 : rawProgress)));
+  const statusLabels = {
+    queued: '\u6b63\u5728\u51c6\u5907\u626b\u63cf',
+    scanning: event.current_folder_title
+      ? `\u6b63\u5728\u68c0\u67e5\uff1a${event.current_folder_title}`
+      : '\u6b63\u5728\u68c0\u67e5\u6536\u85cf\u5939',
+    ready: '\u626b\u63cf\u5b8c\u6210',
+    removing: event.current_folder_title
+      ? `\u6b63\u5728\u5220\u9664\uff1a${event.current_folder_title}`
+      : '\u6b63\u5728\u5220\u9664\u9009\u4e2d\u8d44\u6e90',
+    completed: '\u5220\u9664\u5904\u7406\u5b8c\u6210',
+    failed: '\u4efb\u52a1\u5931\u8d25',
+    cancelled: '\u4efb\u52a1\u5df2\u53d6\u6d88',
+  };
+  $('cleanup-progress-status').textContent = statusLabels[stage] || '\u6b63\u5728\u5904\u7406';
+  $('cleanup-progress-percent').textContent = `${percent}%`;
+  $('cleanup-progress-bar').style.width = `${percent}%`;
+  $('cleanup-folders').textContent = `${event.folders_scanned ?? scan.folders_scanned ?? 0}/${event.folders_total ?? scan.folders_total ?? 0}`;
+  $('cleanup-resources').textContent = event.resources_scanned ?? scan.resources_scanned ?? 0;
+  $('cleanup-problems').textContent = event.problem_total ?? scan.problem_total ?? cleanupState.items.length;
+  $('cleanup-cancel').style.display = ['queued', 'scanning'].includes(stage) ? 'inline-flex' : 'none';
+  $('cleanup-rescan').disabled = cleanupIsRunning();
+  if (isRemoval) {
+    const processed = Number(event.processed || 0);
+    const total = Number(event.total || 0);
+    $('cleanup-remove-status').textContent = total
+      ? `\u5df2\u5904\u7406 ${processed}/${total}\uff0c\u6210\u529f ${Number(event.success || 0)}\uff0c\u5931\u8d25 ${Number(event.failed || 0)}`
+      : '\u6b63\u5728\u51c6\u5907\u5220\u9664';
+  }
+}
+
+function renderCleanupResults() {
+  const counts = {
+    all: cleanupState.items.length,
+    invalid: cleanupState.items.filter(item => item.problem_type === 'invalid').length,
+    inaccessible: cleanupState.items.filter(item => item.problem_type === 'inaccessible').length,
+  };
+  const chips = [
+    ['all', '\u5168\u90e8'],
+    ['invalid', '\u5df2\u5931\u6548'],
+    ['inaccessible', '\u65e0\u6cd5\u8bbf\u95ee'],
+  ];
+  $('cleanup-filter-bar').innerHTML = chips.map(([key, label]) => `
+    <button data-dom-id="cleanup-filter-${key}" type="button" class="btn ${cleanupState.filter === key ? 'btn-primary' : 'btn-secondary'}" style="height:32px;padding:0 12px;font-size:12px;">
+      <span>${label}</span><span class="tabular-nums">${counts[key]}</span>
+    </button>`).join('');
+  chips.forEach(([key]) => {
+    $(`cleanup-filter-${key}`).onclick = () => {
+      cleanupState.filter = key;
+      renderCleanupResults();
+    };
+  });
+
+  const groups = new Map();
+  cleanupVisibleItems().forEach(item => {
+    const fid = Number(item.source_fid);
+    if (!groups.has(fid)) groups.set(fid, { title: item.source_title || String(fid), items: [] });
+    groups.get(fid).items.push(item);
+  });
+  $('cleanup-list').innerHTML = [...groups.entries()].map(([fid, group]) => {
+    const collapsed = cleanupState.collapsedFolders.has(fid);
+    const rows = collapsed ? '' : group.items.map(item => {
+      const removed = Boolean(item.removed);
+      const checked = cleanupState.selected.has(Number(item.id));
+      const title = item.title || item.bvid || `\u8d44\u6e90 ID ${item.resource_id}`;
+      const label = item.problem_type === 'invalid' ? '\u5df2\u5931\u6548' : '\u65e0\u6cd5\u8bbf\u95ee';
+      const badgeStyle = item.problem_type === 'invalid'
+        ? 'background:var(--state-error-surface);color:var(--state-error);'
+        : 'background:var(--background-200);color:var(--muted-foreground);';
+      return `<label class="flex items-start gap-3 p-3 rounded-lg" style="background:var(--card);border:1px solid var(--border);${removed ? 'opacity:.64;' : ''}">
+        <input data-cleanup-item-id="${item.id}" type="checkbox" class="mt-1 shrink-0" ${checked ? 'checked' : ''} ${removed ? 'disabled' : ''}>
+        <span class="flex-1 min-w-0">
+          <span class="block text-sm font-medium" style="color:var(--foreground);overflow-wrap:anywhere;">${escapeHtml(title)}</span>
+          <span class="mt-1 flex flex-wrap items-center gap-2 text-xs" style="color:var(--muted-foreground);">
+            <span class="inline-flex items-center h-5 px-2 rounded-full" style="${badgeStyle}">${label}</span>
+            <span>ID ${escapeHtml(item.resource_id)} \u00b7 ${escapeHtml(item.resource_type || 2)}</span>
+            ${removed ? '<span style="color:var(--state-success);">\u5df2\u5220\u9664</span>' : ''}
+          </span>
+          ${item.remove_error ? `<span class="block mt-1 text-xs" style="color:var(--state-error);">${escapeHtml(item.remove_error)}</span>` : ''}
+        </span>
+      </label>`;
+    }).join('');
+    return `<section class="rounded-lg overflow-hidden" style="background:var(--background-100);border:1px solid var(--border);">
+      <button data-dom-id="cleanup-folder-${fid}" type="button" class="w-full flex items-center gap-2 p-4 text-left" style="background:transparent;border:0;cursor:pointer;color:var(--foreground);">
+        <i data-lucide="${collapsed ? 'chevron-right' : 'chevron-down'}" class="w-4 h-4"></i>
+        <span class="flex-1 min-w-0 truncate text-sm font-semibold">${escapeHtml(group.title)}</span>
+        <span class="text-xs tabular-nums" style="color:var(--muted-foreground);">${group.items.length}</span>
+      </button>
+      <div class="px-3 pb-3 flex flex-col gap-2">${rows}</div>
+    </section>`;
+  }).join('') || `<div class="py-12 text-center text-sm" style="color:var(--muted-foreground);">${cleanupState.items.length ? '\u5f53\u524d\u7b5b\u9009\u4e0b\u6ca1\u6709\u8d44\u6e90' : '\u672a\u53d1\u73b0\u5931\u6548\u6216\u65e0\u6cd5\u8bbf\u95ee\u7684\u8d44\u6e90'}</div>`;
+
+  groups.forEach((_, fid) => {
+    $(`cleanup-folder-${fid}`).onclick = () => {
+      if (cleanupState.collapsedFolders.has(fid)) cleanupState.collapsedFolders.delete(fid);
+      else cleanupState.collapsedFolders.add(fid);
+      renderCleanupResults();
+    };
+  });
+  document.querySelectorAll('[data-cleanup-item-id]').forEach(input => {
+    input.onchange = () => {
+      const id = Number(input.getAttribute('data-cleanup-item-id'));
+      if (input.checked) cleanupState.selected.add(id);
+      else cleanupState.selected.delete(id);
+      updateCleanupSelectionUi();
+    };
+  });
+  updateCleanupSelectionUi();
+  if (window.lucide) lucide.createIcons();
+}
+
+function updateCleanupSelectionUi() {
+  const selectedItems = cleanupState.items.filter(item => cleanupState.selected.has(Number(item.id)) && !item.removed);
+  $('cleanup-selection-summary').textContent = `\u5df2\u9009\u62e9 ${selectedItems.length} \u9879`;
+  $('cleanup-remove').disabled = !selectedItems.length || cleanupIsRunning();
+  $('cleanup-remove').querySelector('span').textContent = `\u5220\u9664\u9009\u4e2d\u9879${selectedItems.length ? ` (${selectedItems.length})` : ''}`;
+}
+
+function renderCleanupPage() {
+  const scan = cleanupState.scan;
+  const statusLabel = scan ? ({
+    queued: '\u7b49\u5f85\u626b\u63cf', scanning: '\u626b\u63cf\u4e2d', ready: '\u626b\u63cf\u5b8c\u6210',
+    removing: '\u5220\u9664\u4e2d', completed: '\u5904\u7406\u5b8c\u6210', failed: '\u5931\u8d25', cancelled: '\u5df2\u53d6\u6d88',
+  }[scan.status] || scan.status) : '';
+  $('cleanup-summary').textContent = scan
+    ? `\u5f53\u524d\u8d26\u53f7\u7684\u5168\u90e8\u6536\u85cf\u5939 \u00b7 ${statusLabel}`
+    : '\u68c0\u67e5\u5f53\u524d\u8d26\u53f7\u7684\u5168\u90e8\u6536\u85cf\u5939';
+  $('cleanup-error').style.display = scan && scan.error ? 'block' : 'none';
+  $('cleanup-error').innerHTML = scan && scan.error
+    ? `<div class="p-3 rounded-lg text-sm" style="background:var(--state-error-surface);color:var(--state-error);">${escapeHtml(scan.error)}</div>`
+    : '';
+  updateCleanupProgress(scan || {});
+  renderCleanupResults();
+}
+
+async function loadCleanupScan(scanId, defaultSelect = false) {
+  const data = await api(`/api/cleanup/scans/${scanId}`);
+  setCleanupData(data, defaultSelect);
+  renderCleanupPage();
+  return data;
+}
+
+function startCleanupStream(scanId) {
+  if (activeEventSource) activeEventSource.close();
+  const es = new EventSource(`/api/cleanup/scans/${scanId}/stream`);
+  activeEventSource = es;
+  es.addEventListener('stage', event => {
+    const data = JSON.parse(event.data);
+    if (cleanupState.scan) cleanupState.scan.status = data.stage;
+    updateCleanupProgress(data);
+    updateCleanupSelectionUi();
+  });
+  es.addEventListener('done', async () => {
+    es.close();
+    if (activeEventSource === es) activeEventSource = null;
+    try {
+      await loadCleanupScan(scanId);
+    } catch (error) {
+      showCleanupError(error.message);
+    }
+  });
+  const handleEnd = event => {
+    const data = JSON.parse(event.data);
+    es.close();
+    if (activeEventSource === es) activeEventSource = null;
+    if (cleanupState.scan) cleanupState.scan.status = 'failed';
+    updateCleanupProgress({ stage: 'failed', progress: 0 });
+    updateCleanupSelectionUi();
+    showCleanupError(data.message || '\u6e05\u7406\u4efb\u52a1\u5931\u8d25');
+  };
+  es.addEventListener('failed', handleEnd);
+  es.addEventListener('cancelled', event => {
+    es.close();
+    if (activeEventSource === es) activeEventSource = null;
+    if (cleanupState.scan) cleanupState.scan.status = 'cancelled';
+    updateCleanupProgress({ stage: 'cancelled', progress: 0 });
+    showCleanupError(JSON.parse(event.data).message || '\u626b\u63cf\u5df2\u53d6\u6d88');
+  });
+  es.onerror = () => {
+    if (es.readyState === EventSource.CLOSED && activeEventSource === es) {
+      showCleanupError('\u8fdb\u5ea6\u8fde\u63a5\u5df2\u5173\u95ed\uff0c\u8bf7\u8fd4\u56de\u9996\u9875\u540e\u91cd\u65b0\u8fdb\u5165');
+    }
+  };
+}
+
+function showCleanupError(message) {
+  $('cleanup-error').style.display = 'block';
+  $('cleanup-error').innerHTML = `<div class="p-3 rounded-lg text-sm" style="background:var(--state-error-surface);color:var(--state-error);">${escapeHtml(message)}</div>`;
+}
+
+async function startCleanupScan() {
+  $('cleanup-error').style.display = 'none';
+  $('cleanup-rescan').disabled = true;
+  cleanupState.scan = { status: 'queued', folders_total: 0, folders_scanned: 0, resources_scanned: 0, problem_total: 0 };
+  cleanupState.items = [];
+  cleanupState.selected.clear();
+  renderCleanupPage();
+  try {
+    const job = await api('/api/cleanup/scans', { method: 'POST' });
+    cleanupState.scan.scan_id = job.scan_id;
+    startCleanupStream(job.scan_id);
+  } catch (error) {
+    cleanupState.scan.status = 'failed';
+    renderCleanupPage();
+    showCleanupError(error.message);
+  }
+}
+
+async function removeCleanupSelected() {
+  const scan = cleanupState.scan;
+  if (!scan) return;
+  const selectedItems = cleanupState.items.filter(item => cleanupState.selected.has(Number(item.id)) && !item.removed);
+  if (!selectedItems.length) return;
+  const folderCount = new Set(selectedItems.map(item => Number(item.source_fid))).size;
+  if (!confirm(`\u5c06\u4ece ${folderCount} \u4e2a\u6536\u85cf\u5939\u4e2d\u5220\u9664 ${selectedItems.length} \u4e2a\u8d44\u6e90\u4f4d\u7f6e\uff0c\u6b64\u64cd\u4f5c\u4e0d\u53ef\u9006\u3002\u662f\u5426\u7ee7\u7eed\uff1f`)) return;
+  try {
+    const result = await api(`/api/cleanup/scans/${scan.scan_id}/remove`, {
+      method: 'POST',
+      body: JSON.stringify({ item_ids: selectedItems.map(item => Number(item.id)) }),
+    });
+    scan.status = 'removing';
+    updateCleanupProgress({ stage: 'removing', processed: 0, total: selectedItems.length, progress: 0 });
+    updateCleanupSelectionUi();
+    startCleanupStream(result.scan_id);
+  } catch (error) {
+    showCleanupError(error.message);
+  }
+}
+
+async function openCleanup() {
+  showView('cleanup');
+  $('cleanup-back').onclick = () => { showView('home'); renderHome(); };
+  $('cleanup-rescan').onclick = startCleanupScan;
+  $('cleanup-select-all').onclick = () => {
+    cleanupState.selected = new Set(cleanupState.items.filter(item => !item.removed).map(item => Number(item.id)));
+    renderCleanupResults();
+  };
+  $('cleanup-select-none').onclick = () => {
+    cleanupState.selected.clear();
+    renderCleanupResults();
+  };
+  $('cleanup-remove').onclick = removeCleanupSelected;
+  $('cleanup-cancel').onclick = async () => {
+    if (!cleanupState.scan) return;
+    $('cleanup-cancel').disabled = true;
+    try {
+      await api(`/api/cleanup/scans/${cleanupState.scan.scan_id}/cancel`, { method: 'POST' });
+    } catch (error) {
+      showCleanupError(error.message);
+    }
+  };
+  try {
+    const latest = await api('/api/cleanup/scans/latest');
+    if (!latest.scan) {
+      await startCleanupScan();
+      return;
+    }
+    setCleanupData(latest, true);
+    renderCleanupPage();
+    if (cleanupIsRunning()) startCleanupStream(latest.scan.scan_id);
+  } catch (error) {
+    showCleanupError(error.message);
+  }
+}
+
+const RESOURCE_TYPE_LABELS = {
+  2: '视频',
+  7: '直播',
+  11: '合集',
+  12: '音频',
+  17: '剧集',
+  19: '番剧',
+  21: '图文专栏',
+};
+
+function folderResourceKey(item) {
+  return `${Number(item.resource_id || 0)}:${Number(item.resource_type || 2)}`;
+}
+
+async function openFolderResources(fid, title, declaredCount) {
+  folderResourceState = {
+    fid: Number(fid),
+    title: String(title || '收藏夹资源'),
+    declaredCount: Number(declaredCount || 0),
+    total: Number(declaredCount || 0),
+    page: 0,
+    hasMore: true,
+    loading: false,
+    items: [],
+    seenKeys: new Set(),
+    allResourceIds: [],
+  };
+  showView('folder-resources');
+  $('folder-resources-title').textContent = folderResourceState.title;
+  $('folder-resources-summary').textContent = `共 ${folderResourceState.declaredCount} 个收藏条目`;
+  $('folder-resources-list').innerHTML = '';
+  $('folder-resources-error').style.display = 'none';
+  $('folder-resources-back').onclick = () => {
+    showView('home');
+    updateFolderSelectionUi();
+  };
+  $('folder-resources-load-more').onclick = () => loadFolderResourcePage();
+  await loadFolderResourcePage();
+}
+
+function appendInaccessibleResources() {
+  if (!folderResourceState) return;
+  folderResourceState.allResourceIds.forEach(item => {
+    const key = folderResourceKey(item);
+    if (folderResourceState.seenKeys.has(key)) return;
+    folderResourceState.seenKeys.add(key);
+    folderResourceState.items.push({
+      resource_id: item.resource_id,
+      resource_type: item.resource_type || 2,
+      bvid: item.bvid || '',
+      title: '',
+      up_name: '',
+      cover_url: '',
+      tname: '',
+      status: 'inaccessible',
+      status_label: '无法访问',
+    });
+  });
+}
+
+function renderFolderResourceList() {
+  if (!folderResourceState) return;
+  const state = folderResourceState;
+  $('folder-resources-summary').textContent = `已展示 ${state.items.length} 个，B站记录 ${state.total || state.declaredCount} 个`;
+  $('folder-resources-list').innerHTML = state.items.map(item => {
+    const typeLabel = RESOURCE_TYPE_LABELS[Number(item.resource_type)] || '其他';
+    const fallbackTitle = item.bvid
+      ? `无法访问的资源（${item.bvid}）`
+      : `无法访问的资源（ID：${item.resource_id || '未知'}）`;
+    const title = item.title || fallbackTitle;
+    const isProblem = item.status === 'invalid' || item.status === 'inaccessible';
+    const statusColor = item.status === 'invalid' ? 'var(--state-error)' : (item.status === 'inaccessible' ? 'var(--muted-foreground)' : 'var(--state-success)');
+    const statusBg = item.status === 'invalid' ? 'var(--state-error-surface)' : (item.status === 'inaccessible' ? 'var(--background-200)' : 'var(--state-success-surface)');
+    const media = item.cover_url
+      ? `<img src="${escapeHtml(item.cover_url)}" alt="" referrerpolicy="no-referrer" class="w-full h-full object-cover" onerror="this.style.display='none';if(this.nextElementSibling)this.nextElementSibling.style.display='block';"><i data-lucide="file-video" class="w-5 h-5" style="display:none;color:var(--icon-muted);"></i>`
+      : `<i data-lucide="${isProblem ? 'file-question' : 'play'}" class="w-5 h-5" style="color:var(--icon-muted);"></i>`;
+    return `<article class="flex items-center gap-3 p-3 rounded-xl" style="background:var(--card);border:1px solid var(--border);box-shadow:var(--shadow-xs);">
+      <div class="shrink-0 w-20 h-12 rounded-lg overflow-hidden flex items-center justify-center" style="background:var(--background-200);">${media}</div>
+      <div class="flex-1 min-w-0">
+        <p class="text-sm font-medium line-clamp-2" style="color:var(--foreground);">${escapeHtml(title)}</p>
+        <p class="mt-1 text-xs truncate" style="color:var(--muted-foreground);">${escapeHtml(item.up_name || item.bvid || `资源 ID ${item.resource_id || ''}`)}</p>
+      </div>
+      <div class="shrink-0 flex flex-col items-end gap-1.5">
+        <span class="text-xs" style="color:var(--muted-foreground);">${typeLabel}</span>
+        <span class="inline-flex items-center h-5 px-2 rounded-full text-xs" style="background:${statusBg};color:${statusColor};">${escapeHtml(item.status_label || '可访问')}</span>
+      </div>
+    </article>`;
+  }).join('') || '<p class="py-12 text-center text-sm" style="color:var(--muted-foreground);">这个收藏夹暂无可展示资源</p>';
+
+  const loadMore = $('folder-resources-load-more');
+  loadMore.style.display = state.hasMore ? 'inline-flex' : 'none';
+  loadMore.disabled = state.loading;
+  loadMore.innerHTML = state.loading
+    ? '<i data-lucide="loader-circle" class="w-4 h-4 spin-slow"></i><span>加载中</span>'
+    : '<i data-lucide="chevrons-down" class="w-4 h-4"></i><span>加载更多</span>';
+  if (window.lucide) lucide.createIcons();
+}
+
+async function loadFolderResourcePage() {
+  if (!folderResourceState || folderResourceState.loading || !folderResourceState.hasMore) return;
+  const state = folderResourceState;
+  const nextPage = state.page + 1;
+  state.loading = true;
+  $('folder-resources-error').style.display = 'none';
+  renderFolderResourceList();
+  try {
+    const data = await api(`/api/folders/${folderResourceState.fid}/resources?page=${nextPage}&page_size=20`);
+    if (nextPage === 1) {
+      state.allResourceIds = data.resource_ids || [];
+      state.title = data.folder && data.folder.title ? data.folder.title : state.title;
+      state.declaredCount = Number(data.folder && data.folder.media_count || state.declaredCount);
+      $('folder-resources-title').textContent = state.title;
+    }
+    (data.items || []).forEach(item => {
+      const key = folderResourceKey(item);
+      if (item.resource_id && state.seenKeys.has(key)) return;
+      if (item.resource_id) state.seenKeys.add(key);
+      state.items.push(item);
+    });
+    state.page = Number(data.page || nextPage);
+    state.total = Number(data.total || state.declaredCount);
+    state.hasMore = Boolean(data.has_more);
+    if (!state.hasMore) appendInaccessibleResources();
+  } catch (error) {
+    $('folder-resources-error').style.display = 'block';
+    $('folder-resources-error').innerHTML = `<div class="flex items-center justify-between gap-3 p-3 rounded-lg" style="background:var(--state-error-surface);color:var(--state-error);">
+      <span class="text-sm">${escapeHtml(error.message)}</span>
+      <button data-dom-id="folder-resources-retry" type="button" class="btn btn-text"><i data-lucide="refresh-cw" class="w-4 h-4"></i><span>重试</span></button>
+    </div>`;
+    $('folder-resources-retry').onclick = () => loadFolderResourcePage();
+  } finally {
+    state.loading = false;
+    renderFolderResourceList();
   }
 }
 
@@ -217,6 +721,38 @@ function updateFolderSelectionUi() {
   btn.querySelector('span').textContent = count ? `开始智能整理（${count} 个收藏夹）` : '开始智能整理';
 }
 
+function normalizeCategoryLimit(value) {
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed)) return 14;
+  return Math.max(3, Math.min(50, parsed));
+}
+
+function updateCustomCategoryLimit(writeBack = false) {
+  const input = $('granularity-custom-limit');
+  categoryLimit = normalizeCategoryLimit(input.value);
+  if (writeBack) input.value = categoryLimit;
+  $('category-limit-summary').textContent = `最多 ${categoryLimit} 个分类`;
+}
+
+function setCategoryGranularity(name) {
+  categoryGranularity = name;
+  if (name === 'custom') {
+    $('granularity-custom-panel').style.display = 'flex';
+    updateCustomCategoryLimit(true);
+  } else {
+    $('granularity-custom-panel').style.display = 'none';
+    categoryLimit = CATEGORY_LIMIT_PRESETS[name] || CATEGORY_LIMIT_PRESETS.balanced;
+    $('category-limit-summary').textContent = `最多 ${categoryLimit} 个分类`;
+  }
+  ['coarse', 'balanced', 'detailed', 'custom'].forEach(key => {
+    const button = $(`granularity-${key}`);
+    const active = key === name;
+    button.style.background = active ? 'var(--card)' : 'transparent';
+    button.style.color = active ? 'var(--foreground)' : 'var(--muted-foreground)';
+    button.style.boxShadow = active ? 'var(--shadow-sm)' : 'none';
+  });
+}
+
 function setMode(mode) {
   currentMode = mode;
   const quick = $('mode-quick'), full = $('mode-full');
@@ -230,7 +766,11 @@ function setMode(mode) {
 }
 
 async function newSession(sourceFids) {
-  const r = await api('/api/session', { method: 'POST', body: JSON.stringify({ source_fids: sourceFids, mode: currentMode }) });
+  if (categoryGranularity === 'custom') updateCustomCategoryLimit(true);
+  const r = await api('/api/session', {
+    method: 'POST',
+    body: JSON.stringify({ source_fids: sourceFids, mode: currentMode, category_limit: categoryLimit }),
+  });
   currentSid = r.session_id;
   showView('progress');
   runPipeline(r.session_id);
@@ -406,7 +946,7 @@ function renderVersionBar(sid, versions) {
   });
 }
 
-function renderRefinePanel(sid) {
+function renderRefinePanelLegacy(sid) {
   $('review-refine-panel').innerHTML = `
     <div class="flex flex-col sm:flex-row gap-2">
       <div class="field flex-1">
@@ -433,6 +973,141 @@ function renderRefinePanel(sid) {
       $('refine-submit').disabled = false;
     }
   };
+}
+
+function refineStageLabel(stage, kind) {
+  if (kind === 'unclassified_retry' && stage === 'analyzing') return '\u6b63\u5728\u51c6\u5907\u91cd\u8bd5\u672a\u5206\u7c7b\u6761\u76ee';
+  return {
+    analyzing: '\u6b63\u5728\u5206\u6790\u5fae\u8c03\u8981\u6c42',
+    refining: '\u6b63\u5728\u751f\u6210\u65b0\u65b9\u6848',
+    merging: '\u6b63\u5728\u5408\u5e76\u4e0e\u5f52\u5e76\u5206\u7c7b',
+    saving: '\u6b63\u5728\u4fdd\u5b58\u65b9\u6848',
+  }[stage] || '\u6b63\u5728\u5904\u7406';
+}
+
+function renderRefinePanel(sid, errorMessage = '') {
+  const planItems = (window.__lastReviewPlan && window.__lastReviewPlan.items) || [];
+  const unclassifiedCount = planItems.filter(item => item.category === '\u672a\u5206\u7c7b').length;
+  const noticeHtml = errorMessage
+    ? `<div class="mt-3 p-3 rounded-lg text-sm" style="background:var(--state-error-surface);color:var(--state-error);">${escapeHtml(errorMessage)}</div>`
+    : (refineNotice
+      ? `<div class="mt-3 p-3 rounded-lg text-sm" style="background:var(--state-success-surface);color:var(--state-success);">${escapeHtml(refineNotice)}</div>`
+      : '');
+  $('review-refine-panel').innerHTML = `
+    <div class="flex flex-col sm:flex-row gap-2">
+      <div class="field flex-1">
+        <i data-lucide="sparkles" class="w-4 h-4"></i>
+        <input data-dom-id="refine-instruction" class="control" type="text" value="${escapeHtml(lastRefineInstruction)}" placeholder="\u4f8b\u5982\uff1a\u628a\u5b98\u65b9\u7684\u4f5c\u54c1\u5355\u72ec\u653e\u5728\u4e00\u4e2a\u6536\u85cf\u5939\u5185">
+      </div>
+      <button data-dom-id="refine-submit" type="button" class="btn btn-primary">
+        <i data-lucide="wand-sparkles" class="w-4 h-4"></i><span>\u751f\u6210\u65b0\u65b9\u6848</span>
+      </button>
+      <button data-dom-id="retry-unclassified" type="button" class="btn btn-secondary" ${unclassifiedCount ? '' : 'disabled'}>
+        <i data-lucide="refresh-cw" class="w-4 h-4"></i><span>\u91cd\u8bd5\u672a\u5206\u7c7b${unclassifiedCount ? ` (${unclassifiedCount})` : ''}</span>
+      </button>
+    </div>
+    ${noticeHtml}`;
+  $('refine-submit').onclick = () => startRefineJob(sid, 'refine');
+  $('retry-unclassified').onclick = () => startRefineJob(sid, 'unclassified_retry');
+  if (window.lucide) lucide.createIcons();
+}
+
+function renderRefineProgress(sid, kind, event = {}) {
+  const progressValue = Number(event.progress || 0);
+  const percent = Math.max(0, Math.min(100, Math.round(progressValue <= 1 ? progressValue * 100 : progressValue)));
+  const processed = Math.max(0, Number(event.processed || 0));
+  const total = Math.max(0, Number(event.total || 0));
+  const retries = Math.max(0, Number(event.retry_count || 0));
+  $('review-refine-panel').innerHTML = `
+    <section data-dom-id="refine-progress" class="p-4 rounded-lg" style="background:var(--background-100);border:1px solid var(--border);" aria-live="polite">
+      <div class="flex items-center justify-between gap-3">
+        <div class="min-w-0">
+          <p data-dom-id="refine-progress-status" class="text-sm font-medium truncate" style="color:var(--foreground);">${refineStageLabel(event.stage, kind)}</p>
+          <p class="mt-1 text-xs" style="color:var(--muted-foreground);">${total ? `\u5df2\u5904\u7406 ${processed}/${total}` : '\u6b63\u5728\u51c6\u5907\u6570\u636e'}${retries ? ` \u00b7 \u5df2\u91cd\u8bd5 ${retries} \u6b21` : ''}</p>
+        </div>
+        <strong data-dom-id="refine-progress-percent" class="text-sm tabular-nums" style="color:var(--brand-600);">${percent}%</strong>
+      </div>
+      <div class="mt-3 h-2 rounded-full overflow-hidden" style="background:var(--background-300);">
+        <div data-dom-id="refine-progress-bar" class="progress-fill h-full rounded-full" style="width:${percent}%;"></div>
+      </div>
+      <div class="mt-3 flex justify-end">
+        <button data-dom-id="refine-cancel" type="button" class="btn btn-text" style="color:var(--state-error);">
+          <i data-lucide="x" class="w-4 h-4"></i><span>\u53d6\u6d88</span>
+        </button>
+      </div>
+    </section>`;
+  $('refine-cancel').onclick = async () => {
+    $('refine-cancel').disabled = true;
+    try {
+      await api(`/api/session/${sid}/refine/cancel`, { method: 'POST' });
+    } catch (error) {
+      renderRefinePanel(sid, error.message);
+    }
+  };
+  if (window.lucide) lucide.createIcons();
+}
+
+async function startRefineJob(sid, kind = 'refine') {
+  if (kind === 'refine') {
+    lastRefineInstruction = $('refine-instruction').value.trim();
+    if (!lastRefineInstruction) return;
+  }
+  refineNotice = '';
+  renderRefineProgress(sid, kind, { stage: 'analyzing', progress: 0 });
+  try {
+    const endpoint = kind === 'unclassified_retry'
+      ? `/api/session/${sid}/retry-unclassified`
+      : `/api/session/${sid}/refine`;
+    const job = await api(endpoint, {
+      method: 'POST',
+      ...(kind === 'refine' ? { body: JSON.stringify({ instruction: lastRefineInstruction }) } : {}),
+    });
+    activeRefineJob = job.job_id;
+    const es = new EventSource(`/api/session/${sid}/refine/stream?job_id=${encodeURIComponent(job.job_id)}`);
+    activeEventSource = es;
+    es.addEventListener('stage', event => {
+      const data = JSON.parse(event.data);
+      renderRefineProgress(sid, job.kind || kind, data);
+    });
+    es.addEventListener('done', event => {
+      const data = JSON.parse(event.data);
+      es.close();
+      if (activeEventSource === es) activeEventSource = null;
+      activeRefineJob = null;
+      const retryResult = data.kind === 'unclassified_retry' ? data.result : null;
+      const plan = retryResult ? retryResult.plan : data.result;
+      if (retryResult) {
+        refineNotice = retryResult.recovered
+          ? `\u5df2\u6062\u590d ${retryResult.recovered} \u6761\uff0c\u4ecd\u6709 ${retryResult.remaining || 0} \u6761\u672a\u5206\u7c7b`
+          : '\u672c\u6b21\u6ca1\u6709\u6062\u590d\u65b0\u6761\u76ee\uff0c\u672a\u521b\u5efa\u7a7a\u65b9\u6848';
+      } else {
+        refineNotice = '\u65b0\u65b9\u6848\u5df2\u751f\u6210';
+      }
+      renderReview(sid, plan);
+    });
+    const handleFailure = event => {
+      const data = JSON.parse(event.data);
+      es.close();
+      if (activeEventSource === es) activeEventSource = null;
+      activeRefineJob = null;
+      renderRefinePanel(sid, data.message || '\u751f\u6210\u65b9\u6848\u5931\u8d25');
+    };
+    es.addEventListener('failed', handleFailure);
+    es.addEventListener('cancelled', event => {
+      es.close();
+      if (activeEventSource === es) activeEventSource = null;
+      activeRefineJob = null;
+      renderRefinePanel(sid, JSON.parse(event.data).message || '\u4efb\u52a1\u5df2\u53d6\u6d88');
+    });
+    es.onerror = () => {
+      if (es.readyState === EventSource.CLOSED && activeRefineJob) {
+        renderRefinePanel(sid, '\u8fdb\u5ea6\u8fde\u63a5\u5df2\u5173\u95ed\uff0c\u53ef\u91cd\u8bd5\u8fde\u63a5');
+      }
+    };
+  } catch (error) {
+    activeRefineJob = null;
+    renderRefinePanel(sid, error.message);
+  }
 }
 
 function toggleSkippedPanel() {
@@ -471,6 +1146,9 @@ function renderSkippedPanelFromItems(sid, items) {
     const groupRemovable = groupItems.filter(it => it.removable && !it.removed);
     const collapsed = collapsedSkippedReasons.has(reasonCode);
     const rowsHtml = collapsed ? '' : groupItems.map(it => {
+      const itemName = it.title || (it.bvid
+        ? `无法访问的视频（BVID：${it.bvid}）`
+        : `无法访问的资源（ID：${it.avid}）`);
       const removedTag = it.removed
         ? `<span class="inline-flex items-center h-5 px-2 rounded-full text-xs" style="background:var(--state-success-surface);color:var(--state-success);">已移除</span>`
         : (it.removable
@@ -479,7 +1157,7 @@ function renderSkippedPanelFromItems(sid, items) {
       const err = it.remove_error ? `<span class="text-xs" style="color:var(--state-error);">${escapeHtml(it.remove_error)}</span>` : '';
       return `<div class="flex flex-wrap items-center gap-x-3 gap-y-1 p-3 rounded-lg" style="background:var(--card);border:1px solid var(--border);">
         <div class="flex-1 min-w-0">
-          <div class="text-sm truncate" style="color:var(--foreground);">${escapeHtml(it.title || ('avid ' + it.avid))}</div>
+          <div class="text-sm truncate" style="color:var(--foreground);">${escapeHtml(itemName)}</div>
           <div class="text-xs mt-0.5" style="color:var(--muted-foreground);">
             <span>来源: 收藏夹 ${escapeHtml(String(it.source_fid))}</span>
             <span class="mx-1">·</span>
@@ -571,10 +1249,92 @@ function toggleReviewGroup(cat) {
   renderReview(currentSid, window.__lastReviewPlan);
 }
 
+function setExecutionProgressVisible(visible) {
+  const actions = $('review-actions');
+  const progress = $('execution-progress');
+  if (actions) actions.style.display = visible ? 'none' : 'flex';
+  if (progress) progress.style.display = visible ? 'block' : 'none';
+}
+
+function updateExecutionProgress(data) {
+  const total = Math.max(0, Number(data.total || 0));
+  const processed = Math.max(0, Number(data.processed || 0));
+  const success = Math.max(0, Number(data.success || 0));
+  const failed = Math.max(0, Number(data.failed || 0));
+  const ratio = typeof data.progress === 'number'
+    ? data.progress
+    : (total ? processed / total : 0);
+  const percent = Math.max(0, Math.min(100, Math.round(ratio * 100)));
+
+  let status = '正在执行整理方案';
+  if (data.phase === 'creating_folders') {
+    const created = Number(data.folders_created || 0);
+    const folderTotal = Number(data.folders_total || 0);
+    status = folderTotal ? `正在创建目标收藏夹（${created}/${folderTotal}）` : '正在准备目标收藏夹';
+  } else if (data.phase === 'moving') {
+    status = data.category ? `正在移动到“${data.category}”` : '正在移动收藏条目';
+  }
+
+  $('execution-status').textContent = status;
+  $('execution-percent').textContent = `${percent}%`;
+  $('execution-progress-bar').style.width = `${percent}%`;
+  $('execution-total').textContent = total;
+  $('execution-processed').textContent = processed;
+  $('execution-success').textContent = success;
+  $('execution-failed').textContent = failed;
+}
+
+function startExecutionProgress(sid) {
+  if (activeEventSource) activeEventSource.close();
+  isExecuting = true;
+  setExecutionProgressVisible(true);
+  updateExecutionProgress({
+    phase: 'creating_folders',
+    progress: 0,
+    processed: 0,
+    total: 0,
+    success: 0,
+    failed: 0,
+  });
+
+  const es = new EventSource(`/api/session/${sid}/execute/stream`);
+  activeEventSource = es;
+  es.addEventListener('stage', event => {
+    updateExecutionProgress(JSON.parse(event.data));
+  });
+  es.addEventListener('done', event => {
+    const data = JSON.parse(event.data || '{}');
+    es.close();
+    if (activeEventSource === es) activeEventSource = null;
+    isExecuting = false;
+    renderResult(sid, data.stats || {});
+  });
+  es.addEventListener('fail', event => {
+    const data = JSON.parse(event.data || '{}');
+    es.close();
+    if (activeEventSource === es) activeEventSource = null;
+    isExecuting = false;
+    $('execution-status').textContent = `执行异常：${data.message || '未知错误'}`;
+    alert(data.message || '执行失败');
+  });
+  es.onerror = () => {
+    if (es.readyState === EventSource.CLOSED) {
+      $('execution-status').textContent = '进度连接已关闭，请返回首页后重新打开任务';
+    } else {
+      $('execution-status').textContent = '连接中断，正在自动重连...';
+    }
+  };
+  $('execution-back-home').onclick = () => {
+    showView('home');
+    renderHome();
+  };
+}
+
 async function renderReview(sid, plan) {
   showView('review');
   currentSid = sid;
   window.__lastReviewPlan = plan;
+  isExecuting = Boolean(plan.session && plan.session.status === 'executing');
   const items = plan.items;
   const videos = plan.videos || {};
   const byCat = {};
@@ -582,7 +1342,9 @@ async function renderReview(sid, plan) {
   const cats = Object.keys(byCat);
   const palette = ['var(--primary)', 'var(--chart-5)', 'var(--chart-3)', 'var(--chart-4)', 'var(--chart-1)', 'var(--chart-2)'];
 
-  let summaryText = `${items.length} 个可整理条目，分成 ${cats.length} 类。可下拉调整单个条目的分类。`;
+  let summaryText = items.length
+    ? `${items.length} 个可整理条目，分成 ${cats.length} 类。可下拉调整单个条目的分类。`
+    : '没有可整理条目。可在下方查看并处理跳过条目。';
   try {
     const sess = plan.session || {};
     const st = sess.stats ? (typeof sess.stats === 'string' ? JSON.parse(sess.stats) : sess.stats) : {};
@@ -652,8 +1414,9 @@ async function renderReview(sid, plan) {
 
   if (window.lucide) lucide.createIcons();
 
-  // 重置执行按钮状态：防止上一次执行残留的 disabled 加载到本次预览
+  // 重置执行区域状态：执行中的会话直接恢复 SSE 监控。
   const execBtn = $('execute-confirm');
+  setExecutionProgressVisible(isExecuting);
   if (isExecuting) {
     execBtn.disabled = true;
     execBtn.innerHTML = '<i data-lucide="loader" class="w-5 h-5 spin-slow"></i><span>执行中...</span>';
@@ -663,25 +1426,10 @@ async function renderReview(sid, plan) {
   }
   if (window.lucide) lucide.createIcons();
 
-  execBtn.onclick = async () => {
+  execBtn.onclick = () => {
     if (isExecuting) return;
     if (!confirm('确认执行？将创建新收藏夹并移动条目，此操作不可逆。')) return;
-    // 进入执行中状态：切换加载动画，禁用按钮
-    isExecuting = true;
-    execBtn.disabled = true;
-    execBtn.innerHTML = '<i data-lucide="loader" class="w-5 h-5 spin-slow"></i><span>执行中...</span>';
-    if (window.lucide) lucide.createIcons();
-    try {
-      const r = await api(`/api/session/${sid}/execute`, { method: 'POST' });
-      isExecuting = false;
-      renderResult(sid, r.stats);
-    } catch (e) {
-      alert(e.message);
-      isExecuting = false;
-      execBtn.disabled = false;
-      execBtn.innerHTML = '<i data-lucide="check" class="w-5 h-5"></i><span>确认执行</span>';
-      if (window.lucide) lucide.createIcons();
-    }
+    startExecutionProgress(sid);
   };
   $('review-back-home').onclick = () => { showView('home'); renderHome(); };
   $('review-abandon').onclick = async () => {
@@ -692,6 +1440,8 @@ async function renderReview(sid, plan) {
       renderHome();
     } catch (e) { alert(e.message); }
   };
+
+  if (isExecuting) startExecutionProgress(sid);
 }
 
 async function adjustItem(sid, resourceId, resourceType, newCat) {

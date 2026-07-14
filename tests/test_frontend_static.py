@@ -128,3 +128,107 @@ def test_frontend_account_logout_ui():
     assert "account-logout" in INDEX_HTML
     assert "logoutAccount" in APP_JS
     assert "/api/logout" in APP_JS
+
+
+def test_frontend_skipped_items_fall_back_to_bvid_and_empty_plan_explains_next_step():
+    assert "无法访问的视频（BVID：${it.bvid}）" in APP_JS
+    assert "无法访问的资源（ID：${it.avid}）" in APP_JS
+    assert "没有可整理条目。可在下方查看并处理跳过条目。" in APP_JS
+
+
+def test_frontend_execution_progress_uses_sse_and_shows_real_counts():
+    for dom_id in [
+        "review-actions",
+        "execution-progress",
+        "execution-status",
+        "execution-percent",
+        "execution-progress-bar",
+        "execution-total",
+        "execution-processed",
+        "execution-success",
+        "execution-failed",
+    ]:
+        assert f'data-dom-id="{dom_id}"' in INDEX_HTML, f"missing {dom_id}"
+    assert "function startExecutionProgress" in APP_JS
+    assert "function updateExecutionProgress" in APP_JS
+    assert "/execute/stream" in APP_JS
+    assert "addEventListener('stage'" in APP_JS
+    assert "addEventListener('done'" in APP_JS
+    assert "addEventListener('fail'" in APP_JS
+    assert "EventSource.CLOSED" in APP_JS
+
+
+def test_frontend_home_allows_direct_delete_for_empty_non_default_folders():
+    assert "function deleteEmptyFolder" in APP_JS
+    assert "delete-empty-folder-${f.fid}" in APP_JS
+    assert "Number(f.media_count) === 0" in APP_JS
+    assert "Number(f.fav_state) !== 1" in APP_JS
+    assert "event.stopPropagation()" in APP_JS
+    assert "method: 'DELETE'" in APP_JS
+    assert "/api/folders/${fid}" in APP_JS
+    assert "确认删除空收藏夹" in APP_JS
+
+
+def test_frontend_supports_category_granularity_presets_and_custom_limit():
+    for dom_id in [
+        "granularity-coarse",
+        "granularity-balanced",
+        "granularity-detailed",
+        "granularity-custom",
+        "granularity-custom-limit",
+        "category-limit-summary",
+    ]:
+        assert f'data-dom-id="{dom_id}"' in INDEX_HTML, f"missing {dom_id}"
+    assert "let categoryLimit = 14" in APP_JS
+    assert "function setCategoryGranularity" in APP_JS
+    assert "coarse: 8" in APP_JS
+    assert "balanced: 14" in APP_JS
+    assert "detailed: 24" in APP_JS
+    assert "category_limit: categoryLimit" in APP_JS
+
+
+def test_frontend_has_read_only_folder_resource_view_and_arrow_navigation():
+    assert 'data-view="folder-resources"' in INDEX_HTML
+    for dom_id in [
+        "folder-resources-back",
+        "folder-resources-title",
+        "folder-resources-summary",
+        "folder-resources-list",
+        "folder-resources-load-more",
+        "folder-resources-error",
+    ]:
+        assert f'data-dom-id="{dom_id}"' in INDEX_HTML, f"missing {dom_id}"
+    assert "view-folder-resources-${f.fid}" in APP_JS
+    assert "function openFolderResources" in APP_JS
+    assert "function loadFolderResourcePage" in APP_JS
+    assert "function appendInaccessibleResources" in APP_JS
+    assert "/api/folders/${folderResourceState.fid}/resources" in APP_JS
+    assert "event.stopPropagation()" in APP_JS
+
+
+def test_folder_resource_covers_avoid_bilibili_hotlink_rejection():
+    assert 'referrerpolicy="no-referrer"' in APP_JS
+    assert "nextElementSibling.style.display='block'" in APP_JS
+
+
+def test_frontend_refine_has_visible_progress_and_unclassified_retry():
+    assert "refine-progress" in APP_JS
+    assert "refine-progress-bar" in APP_JS
+    assert "startRefineJob" in APP_JS
+    assert "retry-unclassified" in APP_JS
+    assert "/retry-unclassified" in APP_JS
+    assert "/refine/stream?job_id=" in APP_JS
+
+
+def test_frontend_has_account_cleanup_view_and_batch_controls():
+    assert "open-cleanup" in INDEX_HTML
+    assert 'data-view="cleanup"' in INDEX_HTML
+    for dom_id in (
+        "cleanup-back", "cleanup-progress", "cleanup-filter-bar",
+        "cleanup-list", "cleanup-select-all", "cleanup-select-none",
+        "cleanup-remove", "cleanup-rescan",
+    ):
+        assert dom_id in INDEX_HTML
+    assert "startCleanupScan" in APP_JS
+    assert "renderCleanupResults" in APP_JS
+    assert "/api/cleanup/scans" in APP_JS

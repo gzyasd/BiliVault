@@ -43,10 +43,10 @@ class ClassifySession:
             value = 100
         return max(10, min(200, value))
 
-    async def create(self, source_fid: int, mode: str) -> str:
-        return await self.create_many([source_fid], mode)
+    async def create(self, source_fid: int, mode: str, category_limit: int = 14) -> str:
+        return await self.create_many([source_fid], mode, category_limit=category_limit)
 
-    async def create_many(self, source_fids: list[int], mode: str) -> str:
+    async def create_many(self, source_fids: list[int], mode: str, category_limit: int = 14) -> str:
         if not self.bili.is_logged_in:
             raise NotLoggedInError()
         active_account = self.storage.get_active_account()
@@ -55,7 +55,11 @@ class ClassifySession:
         for fid in source_fids:
             if fid not in unique_fids:
                 unique_fids.append(fid)
-        sid = self.storage.create_session(source_fid=unique_fids[0], mode=mode)
+        sid = self.storage.create_session(
+            source_fid=unique_fids[0],
+            mode=mode,
+            category_limit=category_limit,
+        )
         if account_id:
             self.storage.update_session_account(sid, account_id)
         folders = {f["fid"]: f for f in await self.bili.get_my_folders(storage=self.storage)}
@@ -107,7 +111,9 @@ class ClassifySession:
             source_fid = src["source_fid"]
             source_collected = 0
             source_skipped = 0
+            source_scanned = 0
             source_expected_initialized = False
+            seen_resource_keys: set[tuple[int, int]] = set()
             if self._is_cancelled(sid):
                 return
             pages_method = getattr(self.bili, "get_folder_resource_pages", None) or self.bili.get_folder_video_pages
@@ -133,6 +139,8 @@ class ClassifySession:
                     v["fid"] = source_fid
                     resource_id = v.get("resource_id") or v.get("avid")
                     resource_type = v.get("resource_type", 2)
+                    if resource_id:
+                        seen_resource_keys.add((resource_id, resource_type))
                     v["avid"] = resource_id
                     v["resource_type"] = resource_type
                     if s["mode"] == "full" and v.get("bvid"):
@@ -150,8 +158,14 @@ class ClassifySession:
                 page_skipped_items = page.get("skipped_items", [])
                 if page_skipped_items:
                     self.storage.add_skipped_items(sid, s.get("account_id"), page_skipped_items)
+                    for item in page_skipped_items:
+                        resource_id = item.get("resource_id", item.get("avid"))
+                        resource_type = item.get("resource_type", 2)
+                        if resource_id:
+                            seen_resource_keys.add((resource_id, resource_type))
                 source_collected += page["usable_count"]
                 source_skipped += page["skipped_count"]
+                source_scanned += page["raw_count"]
                 self.storage.update_session_source_counts(sid, source_fid, source_collected, source_skipped)
                 collected += page["usable_count"]
                 scanned += page["raw_count"]
@@ -161,6 +175,57 @@ class ClassifySession:
                 progress = None
                 if source_total:
                     progress = min(0.99, scanned / source_total)
+                await _emit_progress(on_progress, {
+                    "stage": "collecting", "progress": progress,
+                    "source_fid": source_fid,
+                    "collected": collected, "scanned": scanned, "skipped": skipped,
+                    "source_total": source_total,
+                })
+                if self._is_cancelled(sid):
+                    return
+            try:
+                resource_ids = await self.bili.get_folder_resource_ids(source_fid, storage=self.storage)
+            except Exception as exc:
+                logger.warning("无法交叉核验收藏夹 %s 的资源清单: %s", source_fid, exc)
+            else:
+                unique_resource_ids: list[dict] = []
+                id_keys: set[tuple[int, int]] = set()
+                for resource in resource_ids:
+                    resource_id = resource.get("resource_id")
+                    resource_type = resource.get("resource_type", 2)
+                    if not resource_id or (resource_id, resource_type) in id_keys:
+                        continue
+                    id_keys.add((resource_id, resource_type))
+                    unique_resource_ids.append(resource)
+                hidden_resources = [
+                    resource for resource in unique_resource_ids
+                    if (resource["resource_id"], resource.get("resource_type", 2)) not in seen_resource_keys
+                ]
+                if hidden_resources:
+                    self.storage.add_skipped_items(sid, s.get("account_id"), [
+                        {
+                            "source_fid": source_fid,
+                            "avid": resource["resource_id"],
+                            "bvid": resource.get("bvid", ""),
+                            "title": "",
+                            "resource_type": resource.get("resource_type", 2),
+                            "raw_attr": 0,
+                            "reason_code": "inaccessible",
+                            "reason_label": "无访问权限",
+                            "detail": "B站未返回资源详情，可能仅UP主可见或受权限限制",
+                            "removable": True,
+                        }
+                        for resource in hidden_resources
+                    ])
+                    hidden_count = len(hidden_resources)
+                    source_skipped += hidden_count
+                    skipped += hidden_count
+                    skipped_by_reason["inaccessible"] = skipped_by_reason.get("inaccessible", 0) + hidden_count
+                corrected_source_scanned = max(source_scanned, len(unique_resource_ids))
+                scanned += corrected_source_scanned - source_scanned
+                source_scanned = corrected_source_scanned
+                self.storage.update_session_source_counts(sid, source_fid, source_collected, source_skipped)
+                progress = min(0.99, scanned / source_total) if source_total else None
                 await _emit_progress(on_progress, {
                     "stage": "collecting", "progress": progress,
                     "source_fid": source_fid,
@@ -201,12 +266,7 @@ class ClassifySession:
         video_sources = self.storage.list_session_video_sources(sid)
         # 按会话来源的组合键精确查询，避免同 ID 其他类型缓存被误带入
         resource_keys = sorted({(row["resource_id"], row.get("resource_type", 2)) for row in video_sources})
-        if resource_keys:
-            videos_rows = self.storage.list_videos_by_resource_keys(resource_keys, account_id=s.get("account_id"))
-        else:
-            videos_rows = self.storage.list_videos_by_fid(s["source_fid"])
-        if not videos_rows:
-            videos_rows = self.storage.list_videos_by_fid(s["source_fid"])
+        videos_rows = self.storage.list_videos_by_resource_keys(resource_keys, account_id=s.get("account_id"))
         videos = [VideoInfo(
             avid=r["resource_id"], title=r["title"], up_name=r["up_name"],
             tname=r.get("tname", ""), intro=r.get("intro", ""),
@@ -233,7 +293,14 @@ class ClassifySession:
                 "skipped": prior_stats.get("skipped_total", 0),
             })
 
-        results = await self.ai.classify(videos, batch_size=self._ai_batch_size(), on_progress=ai_progress)
+        results = []
+        if videos:
+            results = await self.ai.classify(
+                videos,
+                batch_size=self._ai_batch_size(),
+                on_progress=ai_progress,
+                max_categories=int(s.get("category_limit") or 14),
+            )
         if self._is_cancelled(sid):
             return
         # 写回时使用 Classification 自身的 resource_type，避免同 ID 不同类型互相覆盖
@@ -299,8 +366,6 @@ class ClassifySession:
             for it in items
         ]
         videos_rows = self.storage.list_videos_by_resource_keys(resource_keys, account_id=s.get("account_id"))
-        if not videos_rows and s.get("source_fid"):
-            videos_rows = self.storage.list_videos_by_fid(s["source_fid"])
         # 用 "resource_id:resource_type" 组合键，避免同 ID 不同类型互相覆盖
         videos = {f"{r['resource_id']}:{r.get('resource_type', 2)}": r for r in videos_rows}
         return {
@@ -322,7 +387,7 @@ class ClassifySession:
         else:
             self.storage.adjust_classification(sid, resource_id, new_category, resource_type=resource_type)
 
-    async def refine_plan(self, sid: str, instruction: str) -> dict:
+    async def refine_plan(self, sid: str, instruction: str, on_progress=None) -> dict:
         s = self.storage.load_session(sid)
         if not s or s["status"] != "pending_review":
             raise StateError("仅预览状态可微调方案")
@@ -360,7 +425,28 @@ class ClassifySession:
             it["category"], it["confidence"], it["reason"],
             resource_type=it.get("resource_type", 2),
         ) for it in current_items]
-        refined = await self.ai.refine_plan(videos, current, instruction)
+        latest_retry_count = 0
+
+        async def ai_progress(event: dict):
+            nonlocal latest_retry_count
+            latest_retry_count = int(event.get("retry_count") or latest_retry_count)
+            await _emit_progress(on_progress, event)
+
+        refined = await self.ai.refine_plan(
+            videos,
+            current,
+            instruction,
+            max_categories=int(s.get("category_limit") or 14),
+            batch_size=self._ai_batch_size(),
+            on_progress=ai_progress,
+        )
+        await _emit_progress(on_progress, {
+            "stage": "saving",
+            "processed": len(current_items),
+            "total": len(current_items),
+            "progress": 1.0,
+            "retry_count": latest_retry_count,
+        })
         self.storage.create_plan_version(
             sid,
             active["version_id"],
@@ -379,6 +465,78 @@ class ClassifySession:
             activate=True,
         )
         return self.get_plan(sid)
+
+    async def retry_unclassified(self, sid: str, on_progress=None) -> dict:
+        s = self.storage.load_session(sid)
+        if not s or s["status"] != "pending_review":
+            raise StateError("仅预览状态可重试未分类条目")
+        active = self.storage.get_active_plan_version(sid)
+        if not active:
+            self.storage.migrate_legacy_classifications_to_version(sid)
+            active = self.storage.get_active_plan_version(sid)
+        if not active:
+            raise StateError("当前没有可重试的方案版本")
+
+        current_items = self.storage.load_plan_items(active["version_id"])
+        targets = [item for item in current_items if item["category"] == "未分类"]
+        if not targets:
+            return {"plan": self.get_plan(sid), "recovered": 0, "remaining": 0}
+        resource_keys = [
+            (item.get("resource_id", item.get("avid")), item.get("resource_type", 2))
+            for item in targets
+        ]
+        rows = self.storage.list_videos_by_resource_keys(resource_keys, account_id=s.get("account_id"))
+        videos = [VideoInfo(
+            avid=row["resource_id"],
+            title=row["title"],
+            up_name=row["up_name"],
+            tname=row.get("tname", ""),
+            intro=row.get("intro", ""),
+            tags=_parse_tags(row.get("tags", "[]")),
+            resource_type=row.get("resource_type", 2),
+        ) for row in rows]
+
+        async def ai_progress(event: dict):
+            await _emit_progress(on_progress, {**event, "stage": "refining"})
+
+        retried = await self.ai.classify(
+            videos,
+            batch_size=self._ai_batch_size(),
+            on_progress=ai_progress,
+            max_categories=int(s.get("category_limit") or 14),
+        ) if videos else []
+        recovered_by_key = {
+            (item.avid, item.resource_type): item
+            for item in retried
+            if item.category != "未分类"
+        }
+        recovered = len(recovered_by_key)
+        if recovered:
+            merged_items = []
+            for item in current_items:
+                key = (item.get("resource_id", item.get("avid")), item.get("resource_type", 2))
+                replacement = recovered_by_key.get(key)
+                merged_items.append({
+                    "avid": key[0],
+                    "resource_id": key[0],
+                    "resource_type": key[1],
+                    "category": replacement.category if replacement else item["category"],
+                    "confidence": replacement.confidence if replacement else item["confidence"],
+                    "reason": replacement.reason if replacement else item["reason"],
+                })
+            await _emit_progress(on_progress, {
+                "stage": "saving", "processed": len(targets), "total": len(targets),
+                "progress": 1.0, "retry_count": 0,
+            })
+            self.storage.create_plan_version(
+                sid,
+                active["version_id"],
+                "重试未分类",
+                merged_items,
+                activate=True,
+            )
+        remaining = len(targets) - recovered
+        return {"plan": self.get_plan(sid), "recovered": recovered, "remaining": remaining}
 
     def get_failed_items(self, sid: str) -> list[dict]:
         return self.storage.list_failed_items(sid)
@@ -456,11 +614,39 @@ class ClassifySession:
         # 为每个 category 创建目标收藏夹
         cat_to_fid: dict[str, int] = {}
         categories = sorted({cat for cat, _ in move_groups.keys()})
+        total = sum(len(res_list) for res_list in move_groups.values())
+        processed = 0
         success = 0
         failed = 0
+        folders_created = 0
+        folders_total = len(categories)
+
+        async def emit_execution_progress(
+            phase: str,
+            category: str = "",
+            source_fid: int | None = None,
+        ) -> None:
+            progress = processed / total if total else 1.0
+            await _emit_progress(on_progress, {
+                "stage": "executing",
+                "phase": phase,
+                "progress": progress,
+                "processed": processed,
+                "total": total,
+                "success": success,
+                "failed": failed,
+                "folders_created": folders_created,
+                "folders_total": folders_total,
+                "category": category,
+                "source_fid": source_fid,
+            })
+
+        await emit_execution_progress("creating_folders")
         for cat in categories:
             try:
                 cat_to_fid[cat] = await self.bili.create_folder(title=cat, privacy=1)
+                folders_created += 1
+                await emit_execution_progress("creating_folders", category=cat)
             except Exception as e:
                 err_code, err_msg = _extract_error(e)
                 for (c, sf), res_list in move_groups.items():
@@ -483,7 +669,14 @@ class ClassifySession:
                             "error_message": err_msg,
                         })
                     failed += len(res_list)
+                    processed += len(res_list)
+                    await emit_execution_progress(
+                        "creating_folders",
+                        category=cat,
+                        source_fid=sf,
+                    )
         # 按分组移动
+        await emit_execution_progress("moving")
         for (cat, sf), res_list in move_groups.items():
             if cat not in cat_to_fid:
                 continue
@@ -522,6 +715,12 @@ class ClassifySession:
                             "error_message": err_msg,
                         })
                     failed += len(chunk)
+                processed += len(chunk)
+                await emit_execution_progress(
+                    "moving",
+                    category=cat,
+                    source_fid=sf,
+                )
         stats = {"success": success, "failed": failed, "total": success + failed}
         await self.refresh_empty_source_candidates(sid)
         self.storage.update_session_status(sid, "done", stats=stats)

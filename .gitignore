@@ -10,6 +10,7 @@ __pycache__/
 _libs/
 *.pyc
 .pytest_cache/
+.trae/
 accounts/
 *.bak
 *.bak-*
