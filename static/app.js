@@ -4,7 +4,9 @@ let currentMode = 'quick';
 let currentSid = null;
 let activeEventSource = null;
 let qrPollToken = 0;
-let lastStableView = 'home';
+let currentView = 'home';
+let utilityReturnContext = null;
+let lastResultStats = null;
 let activeReviewFilter = 'ALL';
 let isExecuting = false;
 let categoryLimit = 14;
@@ -13,10 +15,21 @@ const CATEGORY_LIMIT_PRESETS = { coarse: 8, balanced: 14, detailed: 24 };
 let folderResourceState = null;
 const collapsedReviewGroups = new Set();
 const selectedSourceFids = new Set();
+const selectedEmptyFolderFids = new Set();
+let emptyFolderSelectionMode = false;
+let emptyFolderCandidates = new Map();
+let deletingEmptyFolders = false;
+let folderSortMode = false;
+let folderSortOriginalIds = [];
+let savingFolderOrder = false;
+let folderSortNotice = '';
+let nativeDraggedFolderRow = null;
 let skippedPanelCollapsed = false;
 const collapsedSkippedReasons = new Set();
 let cachedSkippedItems = null;
 let activeRefineJob = null;
+let activeRefineKind = null;
+let lastRefineProgress = null;
 let lastRefineInstruction = '';
 let refineNotice = '';
 const cleanupState = {
@@ -30,6 +43,12 @@ const cleanupState = {
 function escapeHtml(value) {
   const map = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
   return String(value ?? '').replace(/[&<>"']/g, ch => map[ch]);
+}
+
+function isDeletableEmptyFolder(f) {
+  return Number(f.media_count) === 0
+    && Number(f.fav_state) !== 1
+    && !Boolean(f.is_default);
 }
 
 async function api(path, opts = {}) {
@@ -62,12 +81,75 @@ function cleanupPollingAndSSE() {
 }
 
 function showView(name) {
-  cleanupPollingAndSSE();
+  if (currentView !== name) cleanupPollingAndSSE();
   document.querySelectorAll('[data-view]').forEach(s => s.classList.remove('active'));
   document.querySelector(`[data-view="${name}"]`).classList.add('active');
+  currentView = name;
   if (window.lucide) lucide.createIcons();
-  const stableViews = ['home', 'config', 'login'];
-  if (stableViews.includes(name)) lastStableView = name;
+}
+
+function openUtilityView(name) {
+  if (!['config', 'accounts'].includes(currentView)) {
+    utilityReturnContext = { view: currentView, sid: currentSid };
+  }
+  showView(name);
+  if (name === 'config') loadConfig();
+  if (name === 'accounts') renderAccounts();
+}
+
+async function returnFromUtilityView() {
+  const context = utilityReturnContext;
+  utilityReturnContext = null;
+  if (!context) {
+    await start();
+    return;
+  }
+
+  switch (context.view) {
+    case 'progress':
+      if (!context.sid) break;
+      currentSid = context.sid;
+      showView('progress');
+      runPipeline(context.sid, { reset: false });
+      return;
+    case 'review':
+      if (!context.sid) break;
+      await openSession(context.sid);
+      return;
+    case 'result':
+      if (!context.sid || !lastResultStats) break;
+      await renderResult(context.sid, lastResultStats);
+      return;
+    case 'cleanup':
+      await openCleanup();
+      return;
+    case 'folder-resources':
+      if (!folderResourceState) break;
+      await openFolderResources(
+        folderResourceState.fid,
+        folderResourceState.title,
+        folderResourceState.declaredCount,
+      );
+      return;
+    case 'home':
+      showView('home');
+      await renderHome();
+      return;
+    default:
+      break;
+  }
+
+  showView('home');
+  await renderHome();
+}
+
+function resetUtilityReturnAfterAccountChange() {
+  utilityReturnContext = { view: 'home', sid: null };
+  currentSid = null;
+  activeRefineJob = null;
+  activeRefineKind = null;
+  lastRefineProgress = null;
+  lastResultStats = null;
 }
 
 async function start() {
@@ -105,10 +187,10 @@ function loadConfig() {
           ai_batch_size: Number($('config-ai-batch-size').value || 100),
         }),
       });
-      start();
+      await returnFromUtilityView();
     } catch (e) { alert(e.message); }
   };
-  $('config-cancel').onclick = () => { start(); };
+  $('config-cancel').onclick = returnFromUtilityView;
 }
 
 async function renderLogin() {
@@ -144,9 +226,76 @@ async function pollQrcode(key, myToken) {
   tick();
 }
 
+function renderFolderLoadingState() {
+  const sortBar = $('folder-sort-bar');
+  if (sortBar) {
+    sortBar.style.display = 'none';
+    sortBar.innerHTML = '';
+  }
+  const batchBar = $('empty-folder-batch-bar');
+  if (batchBar) {
+    batchBar.style.display = 'none';
+    batchBar.innerHTML = '';
+  }
+  const list = $('folder-list');
+  if (list) {
+    const skeletonRows = Array.from({ length: 4 }, (_, index) => `
+      <div class="flex items-center gap-4 p-4 rounded-xl" style="height:80px;background:var(--card);border:1px solid var(--border);box-shadow:var(--shadow-xs);">
+        <div class="skeleton-pulse shrink-0 w-12 h-12 rounded-xl" style="background:var(--background-300);animation-delay:${index * 90}ms;"></div>
+        <div class="flex-1 min-w-0 flex flex-col gap-2.5">
+          <div class="skeleton-pulse h-4 rounded-md" style="width:${46 + index * 7}%;background:var(--background-300);animation-delay:${index * 90}ms;"></div>
+          <div class="skeleton-pulse h-3 rounded-md" style="width:28%;background:var(--background-200);animation-delay:${index * 90}ms;"></div>
+        </div>
+        <div class="skeleton-pulse shrink-0 w-5 h-5 rounded-md" style="background:var(--background-200);animation-delay:${index * 90}ms;"></div>
+      </div>`).join('');
+    list.innerHTML = `
+      <div data-dom-id="folder-loading-status" class="flex items-center justify-center gap-2 py-2 text-sm" style="color:var(--muted-foreground);" role="status" aria-live="polite">
+        <i data-lucide="loader-circle" class="w-4 h-4 spin-slow"></i><span>正在从 B 站加载收藏夹...</span>
+      </div>
+      ${skeletonRows}`;
+  }
+  const startButton = $('start-organize');
+  if (startButton) {
+    startButton.disabled = true;
+    startButton.querySelector('span').textContent = '正在加载收藏夹';
+  }
+  if (window.lucide) lucide.createIcons();
+}
+
+function renderFolderLoadError(error) {
+  const list = $('folder-list');
+  if (list) {
+    list.innerHTML = `
+      <div class="flex flex-col sm:flex-row items-center justify-between gap-3 p-4 rounded-lg" style="background:var(--state-error-surface);border:1px solid var(--border);" role="alert">
+        <div class="flex items-center gap-2 min-w-0">
+          <i data-lucide="circle-alert" class="w-5 h-5 shrink-0" style="color:var(--state-error);"></i>
+          <span class="text-sm" style="color:var(--state-error);">${escapeHtml(error.message || '收藏夹加载失败')}</span>
+        </div>
+        <button data-dom-id="folder-load-retry" type="button" class="btn btn-secondary shrink-0">
+          <i data-lucide="refresh-cw" class="w-4 h-4"></i><span>重新加载</span>
+        </button>
+      </div>`;
+    $('folder-load-retry').onclick = renderHome;
+  }
+  const startButton = $('start-organize');
+  if (startButton) {
+    startButton.disabled = true;
+    startButton.querySelector('span').textContent = '开始智能整理';
+  }
+  if (window.lucide) lucide.createIcons();
+}
+
 async function renderHome() {
   try {
+    renderFolderLoadingState();
     selectedSourceFids.clear();
+    selectedEmptyFolderFids.clear();
+    emptyFolderSelectionMode = false;
+    emptyFolderCandidates = new Map();
+    folderSortMode = false;
+    folderSortOriginalIds = [];
+    savingFolderOrder = false;
+    folderSortNotice = '';
     updateFolderSelectionUi();
     const resumable = await api('/api/sessions/resumable');
     const resumeEl = $('resume-session');
@@ -170,10 +319,16 @@ async function renderHome() {
     }
 
     const data = await api('/api/folders');
+    emptyFolderCandidates = new Map(data.folders
+      .filter(isDeletableEmptyFolder)
+      .map(f => [Number(f.fid), f]));
     const colors = ['var(--brand-100)', 'var(--state-success-surface)', 'var(--state-error-surface)', 'var(--brand-50)'];
     const iconColors = ['var(--brand-600)', 'var(--state-success)', 'var(--state-error)', 'var(--brand-500)'];
     $('folder-list').innerHTML = data.folders.map((f, i) => `
       <div data-dom-id="select-folder-${f.fid}" data-folder-id="${f.fid}" class="flex items-center gap-4 p-4 rounded-xl cursor-pointer transition-all hover:shadow-md hover:-translate-y-0.5" style="background: var(--card); border: 1px solid var(--border); box-shadow: var(--shadow-xs);">
+        <button data-role="folder-drag-handle" type="button" class="btn btn-text shrink-0" style="width:32px;height:40px;padding:0;display:none;cursor:grab;touch-action:none;" aria-label="拖动调整收藏夹顺序：${escapeHtml(f.title)}" title="拖动排序">
+          <i data-lucide="grip-vertical" class="w-5 h-5"></i>
+        </button>
         <div class="shrink-0 flex items-center justify-center w-12 h-12 rounded-xl" style="background: ${colors[i % 4]};">
           <i data-lucide="folder" style="width:24px;height:24px;color:${iconColors[i % 4]};"></i>
         </div>
@@ -184,17 +339,28 @@ async function renderHome() {
         <div data-role="folder-check" class="shrink-0 items-center justify-center w-6 h-6 rounded-full" style="background:var(--brand-500);color:var(--primary-foreground);display:none;">
           <i data-lucide="check" class="w-4 h-4"></i>
         </div>
-        ${Number(f.media_count) === 0 && Number(f.fav_state) !== 1 ? `
-          <button data-dom-id="delete-empty-folder-${f.fid}" type="button" class="btn btn-text shrink-0" style="width:36px;height:36px;padding:0;color:var(--state-error);" aria-label="删除空收藏夹：${escapeHtml(f.title)}" title="删除空收藏夹">
+        ${isDeletableEmptyFolder(f) ? `
+          <label data-role="empty-folder-batch-select" class="shrink-0 items-center justify-center w-9 h-9" style="display:none;" aria-label="选择空收藏夹：${escapeHtml(f.title)}">
+            <input data-empty-folder-select="${f.fid}" type="checkbox" class="w-4 h-4" style="accent-color:var(--state-error);">
+          </label>
+          <button data-role="empty-folder-single-delete" data-folder-row-action data-dom-id="delete-empty-folder-${f.fid}" type="button" class="btn btn-text shrink-0" style="width:36px;height:36px;padding:0;color:var(--state-error);" aria-label="删除空收藏夹：${escapeHtml(f.title)}" title="删除空收藏夹">
             <i data-lucide="trash-2" class="w-4 h-4"></i>
           </button>` : ''}
-        <button data-dom-id="view-folder-resources-${f.fid}" type="button" class="btn btn-text shrink-0" style="width:36px;height:36px;padding:0;" aria-label="查看收藏夹资源：${escapeHtml(f.title)}" title="查看资源">
+        <button data-folder-row-action data-dom-id="view-folder-resources-${f.fid}" type="button" class="btn btn-text shrink-0" style="width:36px;height:36px;padding:0;" aria-label="查看收藏夹资源：${escapeHtml(f.title)}" title="查看资源">
           <i data-lucide="chevron-right" class="w-[18px] h-[18px]" style="color:var(--icon-300);"></i>
         </button>
       </div>`).join('') || '<p style="color:var(--muted-foreground);">暂无收藏夹</p>';
 
     data.folders.forEach(f => {
-      $(`select-folder-${f.fid}`).onclick = () => toggleFolderSelection(f.fid);
+      const fid = Number(f.fid);
+      $(`select-folder-${f.fid}`).onclick = () => {
+        if (folderSortMode) return;
+        if (emptyFolderSelectionMode && emptyFolderCandidates.has(fid)) {
+          toggleEmptyFolderSelection(fid);
+          return;
+        }
+        toggleFolderSelection(fid);
+      };
       const viewButton = $(`view-folder-resources-${f.fid}`);
       if (viewButton) {
         viewButton.onclick = event => {
@@ -202,13 +368,28 @@ async function renderHome() {
           openFolderResources(f.fid, f.title, f.media_count);
         };
       }
-      if (Number(f.media_count) === 0 && Number(f.fav_state) !== 1) {
+      if (isDeletableEmptyFolder(f)) {
+        const checkbox = document.querySelector(`[data-empty-folder-select="${f.fid}"]`);
+        if (checkbox) {
+          checkbox.onclick = event => event.stopPropagation();
+          checkbox.onchange = () => toggleEmptyFolderSelection(fid, checkbox.checked);
+        }
         const deleteButton = $(`delete-empty-folder-${f.fid}`);
         if (deleteButton) {
           deleteButton.onclick = event => deleteEmptyFolder(event, f.fid, f.title);
         }
       }
+      const row = $(`select-folder-${f.fid}`);
+      const dragHandle = row && row.querySelector('[data-role="folder-drag-handle"]');
+      if (row && dragHandle) {
+        bindFolderDragHandle(dragHandle, row);
+        bindFolderDragSurface(row, row);
+        bindNativeFolderDrag(row);
+      }
     });
+    renderEmptyFolderBatchControls();
+    folderSortOriginalIds = data.folders.map(f => Number(f.fid));
+    renderFolderSortControls();
     if (window.lucide) lucide.createIcons();
 
     Object.keys(CATEGORY_LIMIT_PRESETS).forEach(name => {
@@ -235,8 +416,235 @@ async function renderHome() {
       renderLogin();
       return;
     }
-    alert(e.message);
+    renderFolderLoadError(e);
   }
+}
+
+function getCurrentFolderOrder() {
+  const list = $('folder-list');
+  if (!list) return [];
+  return [...list.querySelectorAll('[data-folder-id]')]
+    .map(row => Number(row.getAttribute('data-folder-id')));
+}
+
+function folderOrderChanged() {
+  const current = getCurrentFolderOrder();
+  return current.length === folderSortOriginalIds.length
+    && current.some((fid, index) => fid !== folderSortOriginalIds[index]);
+}
+
+function updateFolderSortSaveState() {
+  const saveButton = $('folder-sort-save');
+  if (saveButton) saveButton.disabled = savingFolderOrder || !folderOrderChanged();
+}
+
+function updateFolderSortUi() {
+  const list = $('folder-list');
+  if (list) list.classList.toggle('folder-sort-mode', folderSortMode);
+  document.querySelectorAll('[data-folder-id]').forEach(row => {
+    row.setAttribute('aria-grabbed', folderSortMode ? 'false' : '');
+    row.style.touchAction = folderSortMode ? 'none' : 'pan-y';
+    row.draggable = folderSortMode;
+  });
+  document.querySelectorAll('[data-role="folder-drag-handle"]').forEach(handle => {
+    handle.style.display = folderSortMode ? 'inline-flex' : 'none';
+  });
+  document.querySelectorAll('[data-folder-row-action]').forEach(action => {
+    if (folderSortMode) {
+      action.style.display = 'none';
+    } else if (!action.matches('[data-role="empty-folder-single-delete"]')) {
+      action.style.display = 'inline-flex';
+    }
+  });
+  updateFolderSelectionUi();
+  updateFolderSortSaveState();
+}
+
+function renderFolderSortControls() {
+  const bar = $('folder-sort-bar');
+  if (!bar) return;
+  bar.style.display = folderSortOriginalIds.length ? 'block' : 'none';
+  if (!folderSortOriginalIds.length) {
+    bar.innerHTML = '';
+    return;
+  }
+
+  if (!folderSortMode) {
+    bar.innerHTML = `
+      <div class="flex flex-wrap items-center justify-between gap-3 py-3" style="border-bottom:1px solid var(--border);">
+        <span class="text-sm" style="color:${folderSortNotice ? 'var(--state-success)' : 'var(--muted-foreground)'};">${escapeHtml(folderSortNotice || '可调整收藏夹在 B 站中的显示顺序')}</span>
+        <button data-dom-id="folder-sort-start" type="button" class="btn btn-secondary" ${folderSortOriginalIds.length < 2 ? 'disabled' : ''}>
+          <i data-lucide="arrow-up-down" class="w-4 h-4"></i><span>调整收藏夹顺序</span>
+        </button>
+      </div>`;
+    $('folder-sort-start').onclick = startFolderSort;
+  } else {
+    bar.innerHTML = `
+      <div class="flex flex-wrap items-center justify-between gap-3 p-3 rounded-lg" style="background:var(--background-100);border:1px solid var(--border);">
+        <span class="text-sm font-medium" style="color:var(--foreground);">拖动左侧手柄调整顺序</span>
+        <div class="flex items-center gap-2">
+          <button data-dom-id="folder-sort-cancel" type="button" class="btn btn-text" ${savingFolderOrder ? 'disabled' : ''}>取消</button>
+          <button data-dom-id="folder-sort-save" type="button" class="btn btn-primary" ${savingFolderOrder || !folderOrderChanged() ? 'disabled' : ''}>
+            ${savingFolderOrder
+              ? '<i data-lucide="loader-circle" class="w-4 h-4 spin-slow"></i><span>正在保存</span>'
+              : '<i data-lucide="save" class="w-4 h-4"></i><span>保存排序</span>'}
+          </button>
+        </div>
+      </div>`;
+    $('folder-sort-cancel').onclick = cancelFolderSort;
+    $('folder-sort-save').onclick = saveFolderSort;
+  }
+  updateFolderSortUi();
+  if (window.lucide) lucide.createIcons();
+}
+
+function startFolderSort() {
+  if (savingFolderOrder || folderSortOriginalIds.length < 2) return;
+  folderSortOriginalIds = getCurrentFolderOrder();
+  folderSortNotice = '';
+  folderSortMode = true;
+  emptyFolderSelectionMode = false;
+  selectedEmptyFolderFids.clear();
+  selectedSourceFids.clear();
+  renderEmptyFolderBatchControls();
+  renderFolderSortControls();
+}
+
+function cancelFolderSort() {
+  if (savingFolderOrder) return;
+  const list = $('folder-list');
+  folderSortOriginalIds.forEach(fid => {
+    const row = $(`select-folder-${fid}`);
+    if (list && row) list.appendChild(row);
+  });
+  folderSortMode = false;
+  renderEmptyFolderBatchControls();
+  renderFolderSortControls();
+}
+
+async function saveFolderSort() {
+  if (!folderSortMode || savingFolderOrder || !folderOrderChanged()) return;
+  const fids = getCurrentFolderOrder();
+  savingFolderOrder = true;
+  renderFolderSortControls();
+  try {
+    const result = await api('/api/folders/sort', {
+      method: 'POST',
+      body: JSON.stringify({ fids }),
+    });
+    folderSortOriginalIds = (result.fids || fids).map(Number);
+    folderSortMode = false;
+    folderSortNotice = '排序已保存到 B 站';
+  } catch (error) {
+    alert(error.message);
+  } finally {
+    savingFolderOrder = false;
+    renderEmptyFolderBatchControls();
+    renderFolderSortControls();
+  }
+}
+
+function bindFolderDragSurface(surface, row, keyboardEnabled = false) {
+  let activePointerId = null;
+
+  const finishDrag = event => {
+    if (activePointerId == null || (event.pointerId != null && event.pointerId !== activePointerId)) return;
+    if (surface.hasPointerCapture && surface.hasPointerCapture(activePointerId)) {
+      surface.releasePointerCapture(activePointerId);
+    }
+    activePointerId = null;
+    row.classList.remove('folder-sort-dragging');
+    row.setAttribute('aria-grabbed', 'false');
+    updateFolderSortSaveState();
+  };
+
+  surface.addEventListener('pointerdown', event => {
+    if (!folderSortMode || savingFolderOrder) return;
+    if (event.pointerType === 'mouse') return;
+    activePointerId = event.pointerId;
+    if (surface.setPointerCapture) surface.setPointerCapture(activePointerId);
+    row.classList.add('folder-sort-dragging');
+    row.setAttribute('aria-grabbed', 'true');
+    event.preventDefault();
+    event.stopPropagation();
+  });
+  surface.addEventListener('pointermove', event => {
+    if (activePointerId == null || event.pointerId !== activePointerId) return;
+    const scrollEdge = 72;
+    if (event.clientY < scrollEdge) window.scrollBy(0, -18);
+    else if (event.clientY > window.innerHeight - scrollEdge) window.scrollBy(0, 18);
+    const target = document.elementFromPoint(event.clientX, event.clientY)?.closest('[data-folder-id]');
+    if (!target || target === row || target.parentElement !== row.parentElement) return;
+    const rect = target.getBoundingClientRect();
+    const before = event.clientY < rect.top + rect.height / 2;
+    row.parentElement.insertBefore(row, before ? target : target.nextSibling);
+    updateFolderSortSaveState();
+    event.preventDefault();
+  });
+  surface.addEventListener('pointerup', finishDrag);
+  surface.addEventListener('pointercancel', finishDrag);
+  if (keyboardEnabled) {
+    surface.addEventListener('keydown', event => {
+      if (!folderSortMode || savingFolderOrder || !['ArrowUp', 'ArrowDown'].includes(event.key)) return;
+      const sibling = event.key === 'ArrowUp' ? row.previousElementSibling : row.nextElementSibling;
+      if (!sibling || !sibling.matches('[data-folder-id]')) return;
+      if (event.key === 'ArrowUp') row.parentElement.insertBefore(row, sibling);
+      else row.parentElement.insertBefore(sibling, row);
+      updateFolderSortSaveState();
+      event.preventDefault();
+    });
+  }
+}
+
+function bindFolderDragHandle(handle, row) {
+  handle.style.touchAction = 'none';
+  bindFolderDragSurface(handle, row, true);
+  handle.addEventListener('click', event => event.stopPropagation());
+}
+
+function moveFolderRowAtPointer(draggedRow, targetRow, clientY) {
+  if (!draggedRow || !targetRow || draggedRow === targetRow || targetRow.parentElement !== draggedRow.parentElement) {
+    return;
+  }
+  const rect = targetRow.getBoundingClientRect();
+  const before = clientY < rect.top + rect.height / 2;
+  draggedRow.parentElement.insertBefore(draggedRow, before ? targetRow : targetRow.nextSibling);
+  updateFolderSortSaveState();
+}
+
+function bindNativeFolderDrag(row) {
+  row.addEventListener('dragstart', event => {
+    if (!folderSortMode || savingFolderOrder) {
+      event.preventDefault();
+      return;
+    }
+    nativeDraggedFolderRow = row;
+    row.classList.add('folder-sort-dragging');
+    row.setAttribute('aria-grabbed', 'true');
+    if (event.dataTransfer) {
+      event.dataTransfer.effectAllowed = 'move';
+      event.dataTransfer.setData('text/plain', row.getAttribute('data-folder-id') || '');
+    }
+  });
+  row.addEventListener('dragover', event => {
+    if (!folderSortMode || !nativeDraggedFolderRow) return;
+    event.preventDefault();
+    if (event.dataTransfer) event.dataTransfer.dropEffect = 'move';
+    moveFolderRowAtPointer(nativeDraggedFolderRow, row, event.clientY);
+  });
+  row.addEventListener('drop', event => {
+    if (!nativeDraggedFolderRow) return;
+    event.preventDefault();
+    moveFolderRowAtPointer(nativeDraggedFolderRow, row, event.clientY);
+  });
+  row.addEventListener('dragend', () => {
+    if (nativeDraggedFolderRow) {
+      nativeDraggedFolderRow.classList.remove('folder-sort-dragging');
+      nativeDraggedFolderRow.setAttribute('aria-grabbed', 'false');
+    }
+    nativeDraggedFolderRow = null;
+    updateFolderSortSaveState();
+  });
 }
 
 async function deleteEmptyFolder(event, fid, title) {
@@ -253,7 +661,12 @@ async function deleteEmptyFolder(event, fid, title) {
   try {
     await api(`/api/folders/${fid}`, { method: 'DELETE' });
     selectedSourceFids.delete(Number(fid));
-    await renderHome();
+    selectedEmptyFolderFids.delete(Number(fid));
+    emptyFolderCandidates.delete(Number(fid));
+    const row = $(`select-folder-${fid}`);
+    if (row) row.remove();
+    renderEmptyFolderBatchControls();
+    updateFolderSelectionUi();
   } catch (error) {
     if (button) {
       button.disabled = false;
@@ -261,6 +674,141 @@ async function deleteEmptyFolder(event, fid, title) {
       if (window.lucide) lucide.createIcons();
     }
     alert(error.message);
+  }
+}
+
+function updateEmptyFolderSelectionUi() {
+  emptyFolderCandidates.forEach((_, fid) => {
+    const row = $(`select-folder-${fid}`);
+    const checkbox = document.querySelector(`[data-empty-folder-select="${fid}"]`);
+    const selected = selectedEmptyFolderFids.has(fid);
+    if (checkbox) checkbox.checked = selected;
+    if (row && emptyFolderSelectionMode) {
+      row.style.borderColor = selected ? 'var(--state-error)' : 'var(--border)';
+      row.style.background = selected ? 'var(--state-error-surface)' : 'var(--card)';
+    }
+  });
+}
+
+function toggleEmptyFolderSelection(fid, forceSelected = null) {
+  const normalizedFid = Number(fid);
+  if (!emptyFolderCandidates.has(normalizedFid) || deletingEmptyFolders) return;
+  const selected = forceSelected == null
+    ? !selectedEmptyFolderFids.has(normalizedFid)
+    : Boolean(forceSelected);
+  if (selected) selectedEmptyFolderFids.add(normalizedFid);
+  else selectedEmptyFolderFids.delete(normalizedFid);
+  renderEmptyFolderBatchControls();
+}
+
+function setEmptyFolderSelectionMode(enabled) {
+  if (deletingEmptyFolders || folderSortMode) return;
+  emptyFolderSelectionMode = Boolean(enabled);
+  selectedEmptyFolderFids.clear();
+  if (emptyFolderSelectionMode) selectedSourceFids.clear();
+  updateFolderSelectionUi();
+  renderEmptyFolderBatchControls();
+}
+
+function renderEmptyFolderBatchControls() {
+  const bar = $('empty-folder-batch-bar');
+  if (!bar) return;
+  if (folderSortMode) {
+    bar.style.display = 'none';
+    return;
+  }
+  const candidateCount = emptyFolderCandidates.size;
+  if (!candidateCount) {
+    bar.style.display = 'none';
+    bar.innerHTML = '';
+    emptyFolderSelectionMode = false;
+    selectedEmptyFolderFids.clear();
+    return;
+  }
+
+  bar.style.display = 'block';
+  if (!emptyFolderSelectionMode) {
+    bar.innerHTML = `
+      <div class="flex flex-wrap items-center justify-between gap-3 py-3" style="border-bottom:1px solid var(--border);">
+        <span class="text-sm" style="color:var(--muted-foreground);">检测到 ${candidateCount} 个空收藏夹</span>
+        <button data-dom-id="empty-folder-select-start" type="button" class="btn btn-secondary">
+          <i data-lucide="list-checks" class="w-4 h-4"></i><span>批量选择空收藏夹并删除</span>
+        </button>
+      </div>`;
+    $('empty-folder-select-start').onclick = () => setEmptyFolderSelectionMode(true);
+  } else {
+    const selectedCount = selectedEmptyFolderFids.size;
+    bar.innerHTML = `
+      <div class="flex flex-wrap items-center justify-between gap-3 p-3 rounded-lg" style="background:var(--background-100);border:1px solid var(--border);">
+        <span class="text-sm font-medium tabular-nums" style="color:var(--foreground);">已选择 ${selectedCount}/${candidateCount} 个空收藏夹</span>
+        <div class="flex flex-wrap items-center gap-2">
+          <button data-dom-id="empty-folder-select-all" type="button" class="btn btn-text" ${deletingEmptyFolders ? 'disabled' : ''}>全选</button>
+          <button data-dom-id="empty-folder-select-none" type="button" class="btn btn-text" ${deletingEmptyFolders ? 'disabled' : ''}>取消全选</button>
+          <button data-dom-id="empty-folder-select-finish" type="button" class="btn btn-text" ${deletingEmptyFolders ? 'disabled' : ''}>完成</button>
+          <button data-dom-id="empty-folder-delete-selected" type="button" class="btn btn-secondary" style="color:var(--state-error);" ${selectedCount && !deletingEmptyFolders ? '' : 'disabled'}>
+            ${deletingEmptyFolders
+              ? '<i data-lucide="loader-circle" class="w-4 h-4 spin-slow"></i><span>正在删除并确认</span>'
+              : `<i data-lucide="trash-2" class="w-4 h-4"></i><span>删除选中（${selectedCount}）</span>`}
+          </button>
+        </div>
+      </div>`;
+    $('empty-folder-select-all').onclick = () => {
+      selectedEmptyFolderFids.clear();
+      emptyFolderCandidates.forEach((_, fid) => selectedEmptyFolderFids.add(fid));
+      renderEmptyFolderBatchControls();
+    };
+    $('empty-folder-select-none').onclick = () => {
+      selectedEmptyFolderFids.clear();
+      renderEmptyFolderBatchControls();
+    };
+    $('empty-folder-select-finish').onclick = () => setEmptyFolderSelectionMode(false);
+    $('empty-folder-delete-selected').onclick = deleteSelectedEmptyFolders;
+  }
+
+  document.querySelectorAll('[data-role="empty-folder-batch-select"]').forEach(el => {
+    el.style.display = emptyFolderSelectionMode ? 'flex' : 'none';
+  });
+  document.querySelectorAll('[data-role="empty-folder-single-delete"]').forEach(el => {
+    el.style.display = emptyFolderSelectionMode ? 'none' : 'inline-flex';
+  });
+  updateFolderSelectionUi();
+  updateEmptyFolderSelectionUi();
+  if (window.lucide) lucide.createIcons();
+}
+
+async function deleteSelectedEmptyFolders() {
+  const fids = [...selectedEmptyFolderFids];
+  if (!fids.length || deletingEmptyFolders) return;
+  if (!confirm(`确认批量删除 ${fids.length} 个空收藏夹？此操作不可逆。`)) return;
+
+  deletingEmptyFolders = true;
+  renderEmptyFolderBatchControls();
+  try {
+    const result = await api('/api/folders/batch-delete', {
+      method: 'POST',
+      body: JSON.stringify({ fids }),
+    });
+    (result.deleted_fids || []).forEach(fid => {
+      const normalizedFid = Number(fid);
+      selectedSourceFids.delete(normalizedFid);
+      selectedEmptyFolderFids.delete(normalizedFid);
+      emptyFolderCandidates.delete(normalizedFid);
+      const row = $(`select-folder-${normalizedFid}`);
+      if (row) row.remove();
+    });
+    const failedCount = Number(result.stats && result.stats.failed || 0);
+    if (failedCount) {
+      alert(`已删除 ${result.stats.success} 个，${failedCount} 个尚未得到 B 站确认，已保留供重试。`);
+    } else {
+      emptyFolderSelectionMode = false;
+      selectedEmptyFolderFids.clear();
+    }
+  } catch (error) {
+    alert(error.message);
+  } finally {
+    deletingEmptyFolders = false;
+    renderEmptyFolderBatchControls();
+    updateFolderSelectionUi();
   }
 }
 
@@ -716,6 +1264,16 @@ function updateFolderSelectionUi() {
   });
   const btn = $('start-organize');
   if (!btn) return;
+  if (folderSortMode) {
+    btn.disabled = true;
+    btn.querySelector('span').textContent = '请先保存或取消排序';
+    return;
+  }
+  if (emptyFolderSelectionMode) {
+    btn.disabled = true;
+    btn.querySelector('span').textContent = '请先完成空收藏夹选择';
+    return;
+  }
   const count = selectedSourceFids.size;
   btn.disabled = count === 0;
   btn.querySelector('span').textContent = count ? `开始智能整理（${count} 个收藏夹）` : '开始智能整理';
@@ -782,12 +1340,16 @@ async function openSession(sid) {
   renderReview(sid, plan);
 }
 
-function runPipeline(sid) {
-  $('progress-percent').textContent = '0%';
-  $('progress-bar').style.width = '0%';
-  $('progress-status').textContent = '准备中...';
-  $('progress-stats').style.display = 'none';
-  renderSteps('collecting');
+function runPipeline(sid, { reset = true } = {}) {
+  if (reset) {
+    $('progress-percent').textContent = '0%';
+    $('progress-bar').style.width = '0%';
+    $('progress-status').textContent = '准备中...';
+    $('progress-stats').style.display = 'none';
+    renderSteps('collecting');
+  } else {
+    $('progress-status').textContent = '正在恢复整理进度...';
+  }
 
   const es = new EventSource(`/api/session/${sid}/stream`);
   activeEventSource = es;
@@ -1013,6 +1575,8 @@ function renderRefinePanel(sid, errorMessage = '') {
 }
 
 function renderRefineProgress(sid, kind, event = {}) {
+  activeRefineKind = kind;
+  lastRefineProgress = { ...event };
   const progressValue = Number(event.progress || 0);
   const percent = Math.max(0, Math.min(100, Math.round(progressValue <= 1 ? progressValue * 100 : progressValue)));
   const processed = Math.max(0, Number(event.processed || 0));
@@ -1047,12 +1611,19 @@ function renderRefineProgress(sid, kind, event = {}) {
   if (window.lucide) lucide.createIcons();
 }
 
+function clearRefineJobState() {
+  activeRefineJob = null;
+  activeRefineKind = null;
+  lastRefineProgress = null;
+}
+
 async function startRefineJob(sid, kind = 'refine') {
   if (kind === 'refine') {
     lastRefineInstruction = $('refine-instruction').value.trim();
     if (!lastRefineInstruction) return;
   }
   refineNotice = '';
+  activeRefineJob = 'starting';
   renderRefineProgress(sid, kind, { stage: 'analyzing', progress: 0 });
   try {
     const endpoint = kind === 'unclassified_retry'
@@ -1073,7 +1644,7 @@ async function startRefineJob(sid, kind = 'refine') {
       const data = JSON.parse(event.data);
       es.close();
       if (activeEventSource === es) activeEventSource = null;
-      activeRefineJob = null;
+      clearRefineJobState();
       const retryResult = data.kind === 'unclassified_retry' ? data.result : null;
       const plan = retryResult ? retryResult.plan : data.result;
       if (retryResult) {
@@ -1089,23 +1660,24 @@ async function startRefineJob(sid, kind = 'refine') {
       const data = JSON.parse(event.data);
       es.close();
       if (activeEventSource === es) activeEventSource = null;
-      activeRefineJob = null;
+      clearRefineJobState();
       renderRefinePanel(sid, data.message || '\u751f\u6210\u65b9\u6848\u5931\u8d25');
     };
     es.addEventListener('failed', handleFailure);
     es.addEventListener('cancelled', event => {
       es.close();
       if (activeEventSource === es) activeEventSource = null;
-      activeRefineJob = null;
+      clearRefineJobState();
       renderRefinePanel(sid, JSON.parse(event.data).message || '\u4efb\u52a1\u5df2\u53d6\u6d88');
     });
     es.onerror = () => {
       if (es.readyState === EventSource.CLOSED && activeRefineJob) {
+        clearRefineJobState();
         renderRefinePanel(sid, '\u8fdb\u5ea6\u8fde\u63a5\u5df2\u5173\u95ed\uff0c\u53ef\u91cd\u8bd5\u8fde\u63a5');
       }
     };
   } catch (error) {
-    activeRefineJob = null;
+    clearRefineJobState();
     renderRefinePanel(sid, error.message);
   }
 }
@@ -1355,7 +1927,11 @@ async function renderReview(sid, plan) {
   $('review-summary').textContent = summaryText;
 
   renderVersionBar(sid, plan.versions);
-  renderRefinePanel(sid);
+  if (activeRefineJob) {
+    renderRefineProgress(sid, activeRefineKind, lastRefineProgress);
+  } else {
+    renderRefinePanel(sid);
+  }
   renderReviewFilters(cats, byCat);
   renderSkippedPanel(sid);
 
@@ -1493,6 +2069,7 @@ async function renderEmptySourceFolders(sid) {
 }
 
 async function renderResult(sid, stats) {
+  lastResultStats = { ...stats };
   showView('result');
   $('result-stats').innerHTML = `
     <div class="flex flex-col items-center text-center p-4 sm:p-6 rounded-xl border" style="background: var(--state-success-surface); border-color: var(--border);">
@@ -1548,15 +2125,18 @@ async function renderResult(sid, stats) {
   renderEmptySourceFolders(sid);
 }
 
-$('nav-settings').onclick = () => { showView('config'); loadConfig(); };
-$('nav-account').onclick = () => { showView('accounts'); renderAccounts(); };
-$('accounts-back').onclick = () => { showView(lastStableView); if (lastStableView === 'home') renderHome(); };
+$('nav-settings').onclick = () => openUtilityView('config');
+$('nav-account').onclick = () => openUtilityView('accounts');
+$('accounts-back').onclick = returnFromUtilityView;
 $('account-logout').onclick = logoutAccount;
 
 async function logoutAccount() {
   if (!confirm('确定要退出当前 B 站账号吗？退出后需重新扫码登录。')) return;
   try {
     await api('/api/logout', { method: 'POST' });
+    utilityReturnContext = null;
+    currentSid = null;
+    clearRefineJobState();
     showView('login');
     renderLogin();
     $('nav-account-name').textContent = '';
@@ -1591,6 +2171,7 @@ async function renderAccounts() {
       if (btn) btn.onclick = async () => {
         try {
           await api(`/api/accounts/${a.account_id}/switch`, { method: 'POST' });
+          resetUtilityReturnAfterAccountChange();
           renderAccounts();
           renderHome();
         } catch (e) {
@@ -1646,6 +2227,7 @@ async function pollAddAccountLogin(qrcode_key, myToken) {
       const r = await api(`/api/accounts/login/poll?login_id=${encodeURIComponent(addAccountLoginId)}&qrcode_key=${encodeURIComponent(qrcode_key)}`);
       if (r.status === 'success') {
         addAccountQrToken++;
+        resetUtilityReturnAfterAccountChange();
         alert('添加账号成功');
         renderAccounts();
         return;

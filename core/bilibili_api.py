@@ -187,6 +187,8 @@ class BilibiliClient:
                 "media_count": f["media_count"],
                 "cover_url": f.get("cover", ""),
                 "fav_state": f.get("fav_state", 0),
+                "raw_attr": f.get("attr"),
+                "is_default": f.get("attr") == 0,
             }
             for f in data.get("list", [])
         ]
@@ -528,5 +530,12 @@ class BilibiliClient:
         await self._post_form(
             "/x/v3/fav/folder/del",
             {"media_ids": ",".join(str(mid) for mid in media_ids)},
+        )
+        return True
+
+    async def sort_folders(self, media_ids: list[int]) -> bool:
+        await self._post_form(
+            "/x/v3/fav/folder/sort",
+            {"sort": ",".join(str(mid) for mid in media_ids)},
         )
         return True

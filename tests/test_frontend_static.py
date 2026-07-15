@@ -35,6 +35,35 @@ def test_frontend_has_cancel_and_back_buttons():
         assert f'data-dom-id="{dom_id}"' in INDEX_HTML, f"missing {dom_id}"
 
 
+def test_utility_pages_return_to_the_originating_session_view():
+    """设置和账号管理必须能返回进入前的整理页面，而不是固定跳回首页。"""
+    assert "let currentView = 'home'" in APP_JS
+    assert "let utilityReturnContext = null" in APP_JS
+    assert "function openUtilityView" in APP_JS
+    assert "async function returnFromUtilityView" in APP_JS
+    assert "view: currentView" in APP_JS
+    assert "sid: currentSid" in APP_JS
+    assert "case 'progress':" in APP_JS
+    assert "runPipeline(context.sid, { reset: false })" in APP_JS
+    assert "case 'review':" in APP_JS
+    assert "await openSession(context.sid)" in APP_JS
+    assert "openUtilityView('config')" in APP_JS
+    assert "openUtilityView('accounts')" in APP_JS
+    assert "$('config-cancel').onclick = returnFromUtilityView" in APP_JS
+    assert "$('accounts-back').onclick = returnFromUtilityView" in APP_JS
+
+
+def test_utility_back_buttons_are_at_the_top_of_long_pages():
+    accounts = INDEX_HTML.index('<section data-view="accounts">')
+    accounts_title = INDEX_HTML.index('账号管理', accounts)
+    accounts_back = INDEX_HTML.index('data-dom-id="accounts-back"', accounts)
+    config = INDEX_HTML.index('<section data-view="config">')
+    config_title = INDEX_HTML.index('AI 配置', config)
+    config_back = INDEX_HTML.index('data-dom-id="config-cancel"', config)
+    assert accounts_back < accounts_title
+    assert config_back < config_title
+
+
 def test_frontend_closes_event_source_on_view_switch():
     assert "activeEventSource" in APP_JS
     assert "cleanupPollingAndSSE" in APP_JS
@@ -169,6 +198,63 @@ def test_frontend_home_allows_direct_delete_for_empty_non_default_folders():
     assert "确认删除空收藏夹" in APP_JS
 
 
+def test_frontend_home_supports_batch_selecting_and_deleting_empty_folders():
+    assert 'data-dom-id="empty-folder-batch-bar"' in INDEX_HTML
+    assert "批量选择空收藏夹并删除" in APP_JS
+    assert "selectedEmptyFolderFids" in APP_JS
+    assert "emptyFolderSelectionMode" in APP_JS
+    assert "function renderEmptyFolderBatchControls" in APP_JS
+    assert "function toggleEmptyFolderSelection" in APP_JS
+    assert "function deleteSelectedEmptyFolders" in APP_JS
+    assert 'data-role="empty-folder-batch-select"' in APP_JS
+    assert "empty-folder-select-all" in APP_JS
+    assert "empty-folder-select-none" in APP_JS
+    assert "empty-folder-delete-selected" in APP_JS
+    assert "/api/folders/batch-delete" in APP_JS
+    assert "确认批量删除" in APP_JS
+    assert "deleted_fids" in APP_JS
+    assert "!Boolean(f.is_default)" in APP_JS
+
+
+def test_frontend_home_supports_touch_drag_folder_sorting_with_explicit_save():
+    assert 'data-dom-id="folder-sort-bar"' in INDEX_HTML
+    assert "folderSortMode" in APP_JS
+    assert "folderSortOriginalIds" in APP_JS
+    assert 'data-role="folder-drag-handle"' in APP_JS
+    assert "pointerdown" in APP_JS
+    assert "pointermove" in APP_JS
+    assert "pointerup" in APP_JS
+    assert "draggable = folderSortMode" in APP_JS
+    assert "dragstart" in APP_JS
+    assert "dragover" in APP_JS
+    assert "dragend" in APP_JS
+    assert "touchAction" in APP_JS
+    assert "window.scrollBy" in APP_JS
+    assert "keydown" in APP_JS
+    assert "ArrowUp" in APP_JS
+    assert "ArrowDown" in APP_JS
+    assert "getCurrentFolderOrder" in APP_JS
+    assert "bindFolderDragSurface(row, row)" in APP_JS
+    assert "cancelFolderSort" in APP_JS
+    assert "saveFolderSort" in APP_JS
+    assert "/api/folders/sort" in APP_JS
+    assert "保存排序" in APP_JS
+    assert '<script src="/static/app.js?v=' in INDEX_HTML
+
+
+def test_frontend_home_shows_animated_folder_loading_and_retry_states():
+    assert "function renderFolderLoadingState" in APP_JS
+    assert "function renderFolderLoadError" in APP_JS
+    assert 'data-dom-id="folder-loading-status"' in APP_JS
+    assert 'data-dom-id="folder-load-retry"' in APP_JS
+    assert "正在从 B 站加载收藏夹" in APP_JS
+    assert "正在加载收藏夹" in APP_JS
+    assert "skeleton-pulse" in INDEX_HTML
+    assert "skeleton-pulse" in APP_JS
+    assert "prefers-reduced-motion" in INDEX_HTML
+    assert APP_JS.index("renderFolderLoadingState();") < APP_JS.index("await api('/api/sessions/resumable')")
+
+
 def test_frontend_supports_category_granularity_presets_and_custom_limit():
     for dom_id in [
         "granularity-coarse",
@@ -218,6 +304,17 @@ def test_frontend_refine_has_visible_progress_and_unclassified_retry():
     assert "retry-unclassified" in APP_JS
     assert "/retry-unclassified" in APP_JS
     assert "/refine/stream?job_id=" in APP_JS
+
+
+def test_frontend_review_filter_preserves_running_refine_progress():
+    """筛选或折叠预览内容时，不得断开微调 SSE 或覆盖进度面板。"""
+    assert "let activeRefineKind = null" in APP_JS
+    assert "let lastRefineProgress = null" in APP_JS
+    assert "if (currentView !== name) cleanupPollingAndSSE();" in APP_JS
+    assert "activeRefineKind = kind" in APP_JS
+    assert "lastRefineProgress = { ...event }" in APP_JS
+    assert "if (activeRefineJob)" in APP_JS
+    assert "renderRefineProgress(sid, activeRefineKind, lastRefineProgress)" in APP_JS
 
 
 def test_frontend_has_account_cleanup_view_and_batch_controls():

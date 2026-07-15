@@ -161,8 +161,8 @@ async def test_get_my_folders(client, monkeypatch):
             "data": {
                 "count": 2,
                 "list": [
-                    {"id": 100, "title": "默认收藏夹", "media_count": 10, "cover": "http://c.jpg"},
-                    {"id": 200, "title": "学习", "media_count": 5, "cover": ""},
+                    {"id": 100, "title": "默认收藏夹", "media_count": 10, "cover": "http://c.jpg", "attr": 0},
+                    {"id": 200, "title": "学习", "media_count": 5, "cover": "", "attr": 23},
                 ],
             },
         })
@@ -171,6 +171,8 @@ async def test_get_my_folders(client, monkeypatch):
     assert len(folders) == 2
     assert folders[0]["fid"] == 100
     assert folders[0]["title"] == "默认收藏夹"
+    assert folders[0]["is_default"] is True
+    assert folders[1]["is_default"] is False
 
 
 @respx.mock
@@ -553,6 +555,21 @@ async def test_delete_folders(client, monkeypatch):
     assert ok is True
     form = route.calls[0].request.content.decode()
     assert "media_ids=100%2C200" in form
+    assert "csrf=csrf_tok" in form
+
+
+@respx.mock
+async def test_sort_folders_posts_complete_order(client, monkeypatch):
+    monkeypatch.setattr(client, "cookies", {"SESSDATA": "abc", "DedeUserID": "1", "bili_jct": "csrf_tok"})
+    route = respx.post(f"{API_BASE}/x/v3/fav/folder/sort").mock(
+        return_value=httpx.Response(200, json={"code": 0, "message": "0", "ttl": 1, "data": 0})
+    )
+
+    ok = await client.sort_folders(media_ids=[300, 100, 200])
+
+    assert ok is True
+    form = route.calls[0].request.content.decode()
+    assert "sort=300%2C100%2C200" in form
     assert "csrf=csrf_tok" in form
 
 

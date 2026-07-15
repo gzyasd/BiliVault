@@ -258,10 +258,16 @@ def _load_session_stats(session: dict) -> dict:
     return {}
 
 
+def _has_complete_ai_config(cfg: dict | None) -> bool:
+    if not cfg:
+        return False
+    return all(str(cfg.get(key, "")).strip() for key in ("ai_base_url", "ai_api_key", "ai_model"))
+
+
 def get_ai() -> AiClassifier:
     cfg = storage.load_config()
-    if not cfg:
-        raise BibiError("请先在设置页填写 AI 配置", code="AI_NOT_CONFIGURED")
+    if not _has_complete_ai_config(cfg):
+        raise BibiError("请先在设置页填写完整的 AI 配置", code="AI_NOT_CONFIGURED")
     return AiClassifier(cfg["ai_base_url"], cfg["ai_api_key"], cfg["ai_model"])
 
 
@@ -282,7 +288,7 @@ def _active_account_id() -> str:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    if storage.load_config():
+    if _has_complete_ai_config(storage.load_config()):
         ClassifySession(storage, get_bili(), get_ai()).resume_on_startup()
     webbrowser.open("http://127.0.0.1:8765")
     yield
@@ -343,6 +349,14 @@ class DeleteEmptyFoldersIn(BaseModel):
     source_fids: list[int]
 
 
+class DeleteFoldersIn(BaseModel):
+    fids: list[int] = Field(min_length=1, max_length=100)
+
+
+class SortFoldersIn(BaseModel):
+    fids: list[int] = Field(min_length=1, max_length=100)
+
+
 @app.exception_handler(BibiError)
 async def bibi_error_handler(_, exc: BibiError):
     return JSONResponse({"code": exc.code, "message": exc.user_message}, status_code=400)
@@ -351,7 +365,7 @@ async def bibi_error_handler(_, exc: BibiError):
 @app.get("/api/state")
 async def api_state():
     client = get_bili()
-    return {"logged_in": client.is_logged_in, "configured": storage.load_config() is not None}
+    return {"logged_in": client.is_logged_in, "configured": _has_complete_ai_config(storage.load_config())}
 
 
 @app.get("/api/runtime")
@@ -459,7 +473,7 @@ async def api_account_login_poll(login_id: str, qrcode_key: str):
 @app.get("/api/config")
 async def api_get_config():
     cfg = storage.load_config()
-    if not cfg:
+    if not _has_complete_ai_config(cfg):
         return {"configured": False}
     return {
         "configured": True,
@@ -472,7 +486,17 @@ async def api_get_config():
 
 @app.post("/api/config")
 async def api_save_config(cfg: ConfigIn):
-    storage.save_config(cfg.model_dump())
+    saved = cfg.model_dump()
+    existing = storage.load_config() or {}
+    saved["ai_base_url"] = saved["ai_base_url"].strip()
+    saved["ai_model"] = saved["ai_model"].strip()
+    saved["ai_api_key"] = saved["ai_api_key"].strip() or str(existing.get("ai_api_key", "")).strip()
+    if not _has_complete_ai_config(saved):
+        raise BibiError(
+            "请填写完整的 AI 配置（Base URL、API Key 和模型名称）",
+            code="AI_NOT_CONFIGURED",
+        )
+    storage.save_config(saved)
     return {"ok": True}
 
 
@@ -488,6 +512,68 @@ async def api_folders():
     return {"folders": folders}
 
 
+@app.post("/api/folders/sort")
+async def api_sort_folders(payload: SortFoldersIn):
+    requested = [int(fid) for fid in payload.fids]
+    client = get_bili()
+    current = await client.get_my_folders(storage=storage)
+    current_ids = [int(item["fid"]) for item in current]
+
+    if len(set(requested)) != len(requested) or set(requested) != set(current_ids):
+        raise BibiError(
+            "收藏夹排序必须包含当前账号全部收藏夹，且不能重复",
+            code="FOLDER_SORT_INVALID",
+        )
+
+    await client.sort_folders(requested)
+    latest = await client.get_my_folders(storage=storage)
+    confirmed_ids = [int(item["fid"]) for item in latest]
+    if confirmed_ids != requested:
+        raise BibiError(
+            "B站尚未确认新的收藏夹顺序，请刷新后重试",
+            code="FOLDER_SORT_NOT_CONFIRMED",
+        )
+    return {"ok": True, "fids": confirmed_ids}
+
+
+@app.post("/api/folders/batch-delete")
+async def api_batch_delete_folders(payload: DeleteFoldersIn):
+    if _running_pipelines or _running_executions:
+        raise BibiError("有整理任务正在运行，请等待任务完成后再删除收藏夹", code="PIPELINE_RUNNING")
+
+    fids = list(dict.fromkeys(int(fid) for fid in payload.fids))
+    client = get_bili()
+    folders = await client.get_my_folders(storage=storage)
+    folders_by_id = {int(item["fid"]): item for item in folders}
+
+    missing = [fid for fid in fids if fid not in folders_by_id]
+    if missing:
+        raise BibiError("部分收藏夹不存在或已被删除，请刷新后重试", code="FOLDER_NOT_FOUND")
+    if any(
+        int(folders_by_id[fid].get("fav_state", 0)) == 1
+        or bool(folders_by_id[fid].get("is_default"))
+        for fid in fids
+    ):
+        raise BibiError("默认收藏夹不能删除", code="FOLDER_DELETE_PROTECTED")
+    if any(int(folders_by_id[fid].get("media_count", 0)) != 0 for fid in fids):
+        raise BibiError("部分收藏夹已不为空，请刷新后重新选择", code="FOLDER_NOT_EMPTY")
+
+    await client.delete_folders(fids)
+    latest = await client.get_my_folders(storage=storage)
+    remaining = {int(item["fid"]) for item in latest}
+    deleted_fids = [fid for fid in fids if fid not in remaining]
+    failed_fids = [fid for fid in fids if fid in remaining]
+    return {
+        "stats": {
+            "total": len(fids),
+            "success": len(deleted_fids),
+            "failed": len(failed_fids),
+        },
+        "deleted_fids": deleted_fids,
+        "failed_fids": failed_fids,
+    }
+
+
 @app.delete("/api/folders/{fid}")
 async def api_delete_folder(fid: int):
     if _running_pipelines or _running_executions:
@@ -498,7 +584,7 @@ async def api_delete_folder(fid: int):
     folder = next((item for item in folders if int(item["fid"]) == fid), None)
     if not folder:
         raise BibiError("收藏夹不存在或已被删除", code="FOLDER_NOT_FOUND")
-    if int(folder.get("fav_state", 0)) == 1:
+    if int(folder.get("fav_state", 0)) == 1 or bool(folder.get("is_default")):
         raise BibiError("默认收藏夹不能删除", code="FOLDER_DELETE_PROTECTED")
     if int(folder.get("media_count", 0)) != 0:
         raise BibiError("该收藏夹不为空，不能直接删除", code="FOLDER_NOT_EMPTY")

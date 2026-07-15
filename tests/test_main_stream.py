@@ -361,6 +361,69 @@ async def test_config_api_accepts_ai_batch_size(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_config_api_preserves_existing_key_when_password_input_is_blank(monkeypatch, tmp_path):
+    real_storage = Storage(tmp_path)
+    real_storage.save_config({
+        "ai_base_url": "https://old.example.com",
+        "ai_api_key": "existing-secret",
+        "ai_model": "old-model",
+        "default_privacy": 1,
+        "ai_batch_size": 100,
+    })
+    monkeypatch.setattr(main, "storage", real_storage)
+
+    await main.api_save_config(main.ConfigIn(
+        ai_base_url="https://new.example.com",
+        ai_api_key="",
+        ai_model="new-model",
+        ai_batch_size=120,
+    ))
+
+    saved = real_storage.load_config()
+    assert saved["ai_api_key"] == "existing-secret"
+    assert saved["ai_base_url"] == "https://new.example.com"
+    assert saved["ai_model"] == "new-model"
+
+
+@pytest.mark.asyncio
+async def test_config_api_requires_key_when_no_existing_key(monkeypatch, tmp_path):
+    real_storage = Storage(tmp_path)
+    monkeypatch.setattr(main, "storage", real_storage)
+
+    with pytest.raises(BibiError) as exc_info:
+        await main.api_save_config(main.ConfigIn(
+            ai_base_url="https://api.deepseek.com",
+            ai_api_key="",
+            ai_model="deepseek-chat",
+        ))
+
+    assert exc_info.value.code == "AI_NOT_CONFIGURED"
+    assert real_storage.load_config() is None
+
+
+@pytest.mark.asyncio
+async def test_incomplete_config_does_not_block_application_startup(monkeypatch, tmp_path):
+    real_storage = Storage(tmp_path)
+    real_storage.save_config({
+        "ai_base_url": "",
+        "ai_api_key": "",
+        "ai_model": "",
+        "default_privacy": 1,
+        "ai_batch_size": 100,
+    })
+    get_ai = MagicMock(side_effect=AssertionError("incomplete config must not initialize AI"))
+    monkeypatch.setattr(main, "storage", real_storage)
+    monkeypatch.setattr(main, "get_ai", get_ai)
+    monkeypatch.setattr(main.webbrowser, "open", MagicMock())
+
+    async with main.lifespan(main.app):
+        state = await main.api_state()
+
+    assert state["configured"] is False
+    get_ai.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_refine_endpoint_starts_background_job_and_reuses_running_task(monkeypatch):
     sid = "sid-refine"
     release = asyncio.Event()
@@ -593,6 +656,7 @@ async def test_delete_empty_folder_revalidates_and_deletes(monkeypatch):
 @pytest.mark.parametrize(("folder", "expected_code"), [
     ({"fid": 200, "title": "Not empty", "media_count": 1, "fav_state": 0}, "FOLDER_NOT_EMPTY"),
     ({"fid": 200, "title": "Default", "media_count": 0, "fav_state": 1}, "FOLDER_DELETE_PROTECTED"),
+    ({"fid": 200, "title": "Default", "media_count": 0, "fav_state": 0, "is_default": True}, "FOLDER_DELETE_PROTECTED"),
 ])
 async def test_delete_folder_rejects_non_empty_or_default(monkeypatch, folder, expected_code):
     client = MagicMock()
@@ -623,6 +687,124 @@ async def test_delete_folder_requires_post_delete_confirmation(monkeypatch):
         await main.api_delete_folder(200)
 
     assert exc_info.value.code == "FOLDER_DELETE_NOT_CONFIRMED"
+
+
+@pytest.mark.asyncio
+async def test_batch_delete_empty_folders_uses_one_delete_and_one_confirmation(monkeypatch):
+    client = MagicMock()
+    folders = [
+        {"fid": 200, "title": "Empty A", "media_count": 0, "fav_state": 0},
+        {"fid": 201, "title": "Empty B", "media_count": 0, "fav_state": 0},
+    ]
+    client.get_my_folders = AsyncMock(side_effect=[folders, []])
+    client.delete_folders = AsyncMock(return_value=True)
+    monkeypatch.setattr(main, "get_bili", lambda: client)
+    monkeypatch.setattr(main, "_running_pipelines", {})
+    monkeypatch.setattr(main, "_running_executions", {})
+
+    result = await main.api_batch_delete_folders(main.DeleteFoldersIn(fids=[200, 201, 200]))
+
+    assert result == {
+        "stats": {"total": 2, "success": 2, "failed": 0},
+        "deleted_fids": [200, 201],
+        "failed_fids": [],
+    }
+    client.delete_folders.assert_awaited_once_with([200, 201])
+    assert client.get_my_folders.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_batch_delete_empty_folders_rejects_non_empty_before_delete(monkeypatch):
+    client = MagicMock()
+    client.get_my_folders = AsyncMock(return_value=[
+        {"fid": 200, "title": "Empty", "media_count": 0, "fav_state": 0},
+        {"fid": 201, "title": "Changed", "media_count": 1, "fav_state": 0},
+    ])
+    client.delete_folders = AsyncMock()
+    monkeypatch.setattr(main, "get_bili", lambda: client)
+    monkeypatch.setattr(main, "_running_pipelines", {})
+    monkeypatch.setattr(main, "_running_executions", {})
+
+    with pytest.raises(BibiError) as exc_info:
+        await main.api_batch_delete_folders(main.DeleteFoldersIn(fids=[200, 201]))
+
+    assert exc_info.value.code == "FOLDER_NOT_EMPTY"
+    client.delete_folders.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_batch_delete_empty_folders_reports_unconfirmed_items(monkeypatch):
+    client = MagicMock()
+    folders = [
+        {"fid": 200, "title": "Empty A", "media_count": 0, "fav_state": 0},
+        {"fid": 201, "title": "Empty B", "media_count": 0, "fav_state": 0},
+    ]
+    client.get_my_folders = AsyncMock(side_effect=[folders, [folders[1]]])
+    client.delete_folders = AsyncMock(return_value=True)
+    monkeypatch.setattr(main, "get_bili", lambda: client)
+    monkeypatch.setattr(main, "_running_pipelines", {})
+    monkeypatch.setattr(main, "_running_executions", {})
+
+    result = await main.api_batch_delete_folders(main.DeleteFoldersIn(fids=[200, 201]))
+
+    assert result["stats"] == {"total": 2, "success": 1, "failed": 1}
+    assert result["deleted_fids"] == [200]
+    assert result["failed_fids"] == [201]
+
+
+@pytest.mark.asyncio
+async def test_sort_folders_validates_complete_order_and_confirms_result(monkeypatch):
+    client = MagicMock()
+    original = [
+        {"fid": 100, "title": "默认收藏夹"},
+        {"fid": 200, "title": "动画"},
+        {"fid": 300, "title": "科技"},
+    ]
+    confirmed = [original[2], original[0], original[1]]
+    client.get_my_folders = AsyncMock(side_effect=[original, confirmed])
+    client.sort_folders = AsyncMock(return_value=True)
+    monkeypatch.setattr(main, "get_bili", lambda: client)
+
+    result = await main.api_sort_folders(main.SortFoldersIn(fids=[300, 100, 200]))
+
+    assert result == {"ok": True, "fids": [300, 100, 200]}
+    client.sort_folders.assert_awaited_once_with([300, 100, 200])
+    assert client.get_my_folders.await_count == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("requested", [
+    [100, 200],
+    [100, 200, 999],
+    [100, 100, 200],
+])
+async def test_sort_folders_rejects_incomplete_foreign_or_duplicate_ids(monkeypatch, requested):
+    client = MagicMock()
+    client.get_my_folders = AsyncMock(return_value=[
+        {"fid": 100}, {"fid": 200}, {"fid": 300},
+    ])
+    client.sort_folders = AsyncMock()
+    monkeypatch.setattr(main, "get_bili", lambda: client)
+
+    with pytest.raises(BibiError) as exc_info:
+        await main.api_sort_folders(main.SortFoldersIn(fids=requested))
+
+    assert exc_info.value.code == "FOLDER_SORT_INVALID"
+    client.sort_folders.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_sort_folders_requires_remote_confirmation(monkeypatch):
+    client = MagicMock()
+    original = [{"fid": 100}, {"fid": 200}, {"fid": 300}]
+    client.get_my_folders = AsyncMock(side_effect=[original, original])
+    client.sort_folders = AsyncMock(return_value=True)
+    monkeypatch.setattr(main, "get_bili", lambda: client)
+
+    with pytest.raises(BibiError) as exc_info:
+        await main.api_sort_folders(main.SortFoldersIn(fids=[300, 100, 200]))
+
+    assert exc_info.value.code == "FOLDER_SORT_NOT_CONFIRMED"
 
 
 @pytest.mark.asyncio
