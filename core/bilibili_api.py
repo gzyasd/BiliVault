@@ -29,6 +29,15 @@ _DEFAULT_HEADERS = {
 _INVALID_TITLES = {"已失效视频", "已失效", "失效视频", ""}
 
 
+def _normalize_bilibili_image_url(value) -> str:
+    url = str(value or "").strip()
+    if url.startswith("//"):
+        return f"https:{url}"
+    if url.startswith("http://"):
+        return f"https://{url[7:]}"
+    return url
+
+
 def _is_invalid_resource(m: dict) -> bool:
     """attr 未置 bit0 但表现为失效的资源。
 
@@ -245,7 +254,7 @@ class BilibiliClient:
                 "fid": f["id"],
                 "title": f["title"],
                 "media_count": f["media_count"],
-                "cover_url": f.get("cover", ""),
+                "cover_url": _normalize_bilibili_image_url(f.get("cover")),
                 "fav_state": f.get("fav_state", 0),
                 "raw_attr": f.get("attr"),
                 "is_default": f.get("attr") == 0,
@@ -263,7 +272,7 @@ class BilibiliClient:
         return {
             "mid": info.get("mid", 0),
             "uname": info.get("name", ""),
-            "avatar_url": info.get("face", ""),
+            "avatar_url": _normalize_bilibili_image_url(info.get("face")),
         }
 
     async def get_folder_videos(self, fid: int, storage=None, page_size: int = 20, sleep_seconds: float = 0.3):
@@ -338,7 +347,7 @@ class BilibiliClient:
                     "tags": "[]",
                     "up_name": m.get("upper", {}).get("name", ""),
                     "up_mid": m.get("upper", {}).get("mid", 0),
-                    "cover_url": m.get("cover", ""),
+                    "cover_url": _normalize_bilibili_image_url(m.get("cover")),
                     "tname": m.get("tname", ""),
                     "fid": fid,
                 })
@@ -434,7 +443,7 @@ class BilibiliClient:
                     "tags": "[]",
                     "up_name": m.get("upper", {}).get("name", ""),
                     "up_mid": m.get("upper", {}).get("mid", 0),
-                    "cover_url": m.get("cover", ""),
+                    "cover_url": _normalize_bilibili_image_url(m.get("cover")),
                     "tname": m.get("tname", ""),
                     "fid": fid,
                 }
@@ -502,7 +511,7 @@ class BilibiliClient:
                 "bvid": media.get("bvid", ""),
                 "title": media.get("title", ""),
                 "up_name": media.get("upper", {}).get("name", ""),
-                "cover_url": media.get("cover", ""),
+                "cover_url": _normalize_bilibili_image_url(media.get("cover")),
                 "tname": media.get("tname", ""),
                 "raw_attr": int(media.get("attr", 0) or 0),
                 "status": "invalid" if invalid else "available",
@@ -551,7 +560,7 @@ class BilibiliClient:
             "tags": [t.get("tag_name", "") for t in tag_data if t.get("tag_name")],
             "up_name": view_data.get("owner", {}).get("name", ""),
             "up_mid": view_data.get("owner", {}).get("mid", 0),
-            "cover_url": view_data.get("pic", ""),
+            "cover_url": _normalize_bilibili_image_url(view_data.get("pic")),
             "tname": view_data.get("tname", ""),
         }
 

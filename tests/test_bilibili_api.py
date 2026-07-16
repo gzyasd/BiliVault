@@ -186,6 +186,7 @@ async def test_get_my_folders(client, monkeypatch):
     assert folders[0]["fid"] == 100
     assert folders[0]["title"] == "默认收藏夹"
     assert folders[0]["is_default"] is True
+    assert folders[0]["cover_url"] == "https://c.jpg"
     assert folders[1]["is_default"] is False
 
 
@@ -436,9 +437,9 @@ async def test_get_folder_resource_page_reads_requested_page_and_keeps_display_s
         return {
             "info": {"media_count": 60},
             "medias": [
-                {"id": 1, "bvid": "BV1", "title": "正常视频", "upper": {"name": "UP1"}, "cover": "c1", "attr": 0, "type": 2, "tname": "科技"},
+                {"id": 1, "bvid": "BV1", "title": "正常视频", "upper": {"name": "UP1"}, "cover": "http://i0.hdslb.com/c1.jpg", "attr": 0, "type": 2, "tname": "科技"},
                 {"id": 2, "bvid": "BV2", "title": "已失效视频", "upper": {"name": ""}, "cover": "", "attr": 1, "type": 2, "tname": ""},
-                {"id": 3, "bvid": "", "title": "正常合集", "upper": {"name": "UP3"}, "cover": "c3", "attr": 0, "type": 11, "tname": "合集"},
+                {"id": 3, "bvid": "", "title": "正常合集", "upper": {"name": "UP3"}, "cover": "//i0.hdslb.com/c3.jpg", "attr": 0, "type": 11, "tname": "合集"},
             ],
             "has_more": True,
         }
@@ -456,6 +457,11 @@ async def test_get_folder_resource_page_reads_requested_page_and_keeps_display_s
         (1, 2, "available"),
         (2, 2, "invalid"),
         (3, 11, "available"),
+    ]
+    assert [item["cover_url"] for item in result["items"]] == [
+        "https://i0.hdslb.com/c1.jpg",
+        "",
+        "https://i0.hdslb.com/c3.jpg",
     ]
 
 
@@ -586,7 +592,7 @@ async def test_get_my_profile(client, monkeypatch):
     profile = await client.get_my_profile()
     assert profile["mid"] == 12345
     assert profile["uname"] == "测试用户"
-    assert profile["avatar_url"] == "http://x/avatar.jpg"
+    assert profile["avatar_url"] == "https://x/avatar.jpg"
 
 
 @respx.mock
