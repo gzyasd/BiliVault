@@ -1,17 +1,24 @@
 import asyncio
 import base64
+import hmac
 import io
+import inspect
 import json
 import logging
 import os
 import re
 import shutil
 import sys
+import time
 import uuid
 import webbrowser
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import datetime
+from ipaddress import ip_address
 from pathlib import Path
+from typing import Literal
+from urllib.parse import urlsplit
 
 BASE_DIR = Path(__file__).parent
 for _vendor in (BASE_DIR / ".libs", BASE_DIR / "_libs"):
@@ -19,10 +26,10 @@ for _vendor in (BASE_DIR / ".libs", BASE_DIR / "_libs"):
         sys.path.insert(0, str(_vendor))
 
 import qrcode
-from fastapi import FastAPI, Query
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi import FastAPI, Query, Request
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from core.ai_classifier import AiClassifier
 from core.bilibili_api import BilibiliClient
@@ -47,28 +54,272 @@ class UvicornAccessFilter(logging.Filter):
 
 
 logging.getLogger("uvicorn.access").addFilter(UvicornAccessFilter())
+logger = logging.getLogger(__name__)
 
 STARTED_AT = datetime.now().isoformat(timespec="seconds")
 
 storage = Storage(BASE_DIR)
 bili = BilibiliClient(cookie_store_path=BASE_DIR / "bilibili_cookie.json")
+_bili_clients: dict[tuple[str, str], BilibiliClient] = {}
+_ai_classifier: AiClassifier | None = None
+_ai_signature: tuple[str, str, str] | None = None
 _running_pipelines: dict[str, asyncio.Task] = {}
 _running_executions: dict[str, asyncio.Task] = {}
 _execution_progress: dict[str, dict] = {}
+_execution_job_ids: dict[str, str] = {}
+_execution_jobs: dict[str, dict] = {}
 _running_refinements: dict[str, str] = {}
 _refinement_jobs: dict[str, dict] = {}
 _cleanup_jobs: dict[str, dict] = {}
 _pending_logins: dict[str, "BilibiliClient"] = {}
+_pending_login_started: dict[str, float] = {}
+_pending_login_expiry_handles: dict[str, asyncio.TimerHandle] = {}
+
+JOB_RETENTION_SECONDS = 30 * 60
+LOGIN_SESSION_TTL_SECONDS = 10 * 60
+MAX_RETAINED_JOBS = 100
+ACCESS_COOKIE_NAME = "bibitool_access"
+
+
+@dataclass(frozen=True)
+class BindSettings:
+    host: str
+    port: int
+    lan_auth_enabled: bool
+    token: str
+    allowed_hosts: frozenset[str]
+
+
+def _is_loopback_host(host: str) -> bool:
+    normalized = host.strip().strip("[]").lower()
+    if normalized == "localhost":
+        return True
+    try:
+        return ip_address(normalized).is_loopback
+    except ValueError:
+        return False
+
+
+def _resolve_bind_settings() -> BindSettings:
+    host = (os.getenv("BIBITOOL_HOST") or "127.0.0.1").strip()
+    try:
+        port = int(os.getenv("BIBITOOL_PORT") or "8765")
+    except ValueError as exc:
+        raise RuntimeError("BIBITOOL_PORT 必须是有效端口号") from exc
+    if not 1 <= port <= 65535:
+        raise RuntimeError("BIBITOOL_PORT 必须在 1 到 65535 之间")
+
+    token = (os.getenv("BIBITOOL_LAN_TOKEN") or "").strip()
+    configured_hosts = {
+        item.strip().strip("[]").lower()
+        for item in (os.getenv("BIBITOOL_ALLOWED_HOSTS") or "").split(",")
+        if item.strip()
+    }
+    is_lan_bind = not _is_loopback_host(host)
+    if is_lan_bind and len(token) < 16:
+        raise RuntimeError("非本机监听必须设置至少 16 位的 BIBITOOL_LAN_TOKEN")
+    if is_lan_bind and not configured_hosts:
+        raise RuntimeError("非本机监听必须设置 BIBITOOL_ALLOWED_HOSTS")
+
+    allowed_hosts = {"127.0.0.1", "localhost", "::1", *configured_hosts}
+    if host not in {"0.0.0.0", "::"}:
+        allowed_hosts.add(host.strip("[]").lower())
+    return BindSettings(
+        host=host,
+        port=port,
+        lan_auth_enabled=is_lan_bind or bool(token),
+        token=token,
+        allowed_hosts=frozenset(allowed_hosts),
+    )
+
+
+def _prune_finished_jobs(now: float | None = None) -> None:
+    now = time.monotonic() if now is None else now
+    for registry in (_execution_jobs, _refinement_jobs, _cleanup_jobs):
+        expired = [
+            key for key, job in registry.items()
+            if job.get("task") is not None
+            and job["task"].done()
+            and now - float(job.get("finished_at", now)) > JOB_RETENTION_SECONDS
+        ]
+        for key in expired:
+            registry.pop(key, None)
+        terminal = sorted(
+            (
+                (float(job.get("finished_at", now)), key)
+                for key, job in registry.items()
+                if job.get("task") is not None and job["task"].done()
+            ),
+            key=lambda item: item[0],
+        )
+        for _, key in terminal[:-MAX_RETAINED_JOBS]:
+            registry.pop(key, None)
+
+
+def _discard_pending_login(login_id: str) -> None:
+    expiry_handle = _pending_login_expiry_handles.pop(login_id, None)
+    if expiry_handle is not None:
+        expiry_handle.cancel()
+    client = _pending_logins.pop(login_id, None)
+    _pending_login_started.pop(login_id, None)
+    if not client:
+        return
+    close = getattr(client, "aclose", None)
+    if close:
+        result = close()
+        if inspect.isawaitable(result):
+            try:
+                asyncio.get_running_loop().create_task(result)
+            except RuntimeError:
+                result.close()
+    if not client.cookie_store_path:
+        return
+    try:
+        if client.cookie_store_path.exists():
+            client.cookie_store_path.unlink()
+    except OSError:
+        logger.warning("无法清理过期登录临时文件: %s", client.cookie_store_path)
+
+
+def _register_pending_login(login_id: str, client: BilibiliClient) -> None:
+    if login_id in _pending_logins:
+        _discard_pending_login(login_id)
+    _pending_logins[login_id] = client
+    _pending_login_started[login_id] = time.monotonic()
+    _pending_login_expiry_handles[login_id] = asyncio.get_running_loop().call_later(
+        LOGIN_SESSION_TTL_SECONDS,
+        _discard_pending_login,
+        login_id,
+    )
+
+
+def _prune_pending_logins(now: float | None = None) -> None:
+    now = time.monotonic() if now is None else now
+    expired = [
+        login_id for login_id, started_at in _pending_login_started.items()
+        if now - started_at > LOGIN_SESSION_TTL_SECONDS
+    ]
+    for login_id in expired:
+        _discard_pending_login(login_id)
+
+
+def _job_belongs_to_account(sid: str | None, job_account_id: str | None, account_id: str | None) -> bool:
+    if account_id is None:
+        return True
+    if job_account_id:
+        return str(job_account_id) == account_id
+    if not sid:
+        return True
+    try:
+        session = storage.load_session(sid)
+    except (AttributeError, TypeError):
+        return True
+    return bool(session and str(session.get("account_id") or "") == account_id)
+
+
+def _has_running_tasks(account_id: str | None = None) -> bool:
+    for sid, task in _running_pipelines.items():
+        if not task.done() and _job_belongs_to_account(sid, None, account_id):
+            return True
+    for sid, task in _running_executions.items():
+        if not task.done() and _job_belongs_to_account(sid, None, account_id):
+            return True
+    for job in _refinement_jobs.values():
+        task = job.get("task")
+        if task and not task.done() and _job_belongs_to_account(job.get("sid"), job.get("account_id"), account_id):
+            return True
+    for job in _cleanup_jobs.values():
+        task = job.get("task")
+        if task and not task.done() and _job_belongs_to_account(None, job.get("account_id"), account_id):
+            return True
+    return False
+
+
+def _ensure_account_tasks_idle(account_id: str | None) -> None:
+    if _has_running_tasks(account_id):
+        raise BibiError("有后台任务正在运行，请完成或取消后再切换或退出账号", code="PIPELINE_RUNNING")
+
+
+async def _close_bili_client(client) -> None:
+    close = getattr(client, "aclose", None)
+    if not close:
+        return
+    result = close()
+    if inspect.isawaitable(result):
+        await result
+
+
+async def _shutdown_runtime() -> None:
+    global _ai_classifier, _ai_signature
+    for handle in _pending_login_expiry_handles.values():
+        handle.cancel()
+    _pending_login_expiry_handles.clear()
+    task_candidates = [
+        *_running_pipelines.values(),
+        *_running_executions.values(),
+        *(job.get("task") for job in _execution_jobs.values()),
+        *(job.get("task") for job in _refinement_jobs.values()),
+        *(job.get("task") for job in _cleanup_jobs.values()),
+    ]
+    current = asyncio.current_task()
+    current_loop = asyncio.get_running_loop()
+    tasks = {
+        task for task in task_candidates
+        if task is not None
+        and task is not current
+        and getattr(task, "get_loop", lambda: current_loop)() is current_loop
+    }
+    for task in tasks:
+        if not task.done():
+            task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    clients_by_id = {id(bili): bili}
+    for client in _bili_clients.values():
+        clients_by_id[id(client)] = client
+    for client in _pending_logins.values():
+        clients_by_id[id(client)] = client
+        cookie_path = getattr(client, "cookie_store_path", None)
+        if cookie_path:
+            try:
+                path = Path(cookie_path)
+                if path.exists():
+                    path.unlink()
+            except OSError:
+                logger.warning("无法清理登录临时文件: %s", cookie_path)
+    await asyncio.gather(*[
+        _close_bili_client(client) for client in clients_by_id.values()
+    ], return_exceptions=True)
+    if _ai_classifier is not None:
+        await _close_bili_client(_ai_classifier)
+        _ai_classifier = None
+        _ai_signature = None
+
+    _running_pipelines.clear()
+    _running_executions.clear()
+    _execution_progress.clear()
+    _execution_job_ids.clear()
+    _execution_jobs.clear()
+    _running_refinements.clear()
+    _refinement_jobs.clear()
+    _cleanup_jobs.clear()
+    _pending_logins.clear()
+    _pending_login_started.clear()
+    _bili_clients.clear()
 
 
 def get_bili() -> BilibiliClient:
     """根据活跃账号返回对应的 B 站客户端；无活跃账号时返回全局默认客户端。"""
     account = storage.get_active_account()
     if account and account.get("cookie_path"):
-        return BilibiliClient(
-            cookie_store_path=BASE_DIR / account["cookie_path"],
-            account_id=account["account_id"],
-        )
+        cookie_path = (BASE_DIR / account["cookie_path"]).resolve()
+        key = (str(account["account_id"]), str(cookie_path))
+        client = _bili_clients.get(key)
+        if client is None:
+            client = BilibiliClient(cookie_store_path=cookie_path, account_id=account["account_id"])
+            _bili_clients[key] = client
+        return client
     return bili
 
 
@@ -81,6 +332,9 @@ async def _save_account_from_login(client: BilibiliClient) -> None:
     if not profile.get("mid"):
         return
     account_id = str(profile["mid"])
+    active = storage.get_active_account()
+    if active and str(active["account_id"]) != account_id:
+        _ensure_account_tasks_idle(str(active["account_id"]))
     cookie_path = f"accounts/{account_id}/bilibili_cookie.json"
     final_cookie_path = BASE_DIR / cookie_path
     final_cookie_path.parent.mkdir(parents=True, exist_ok=True)
@@ -102,6 +356,11 @@ async def _save_account_from_login(client: BilibiliClient) -> None:
         "is_active": 1,
     })
     storage.activate_account(account_id)
+    cache_key = (account_id, str(final_cookie_path.resolve()))
+    _bili_clients[cache_key] = BilibiliClient(
+        cookie_store_path=final_cookie_path,
+        account_id=account_id,
+    )
 
 
 def _forget_pipeline_when_done(sid: str, task: asyncio.Task) -> None:
@@ -124,10 +383,15 @@ def _get_or_start_pipeline(sid: str, mgr: ClassifySession, on_progress) -> tuple
     return task, False
 
 
-def _forget_execution_when_done(sid: str, task: asyncio.Task) -> None:
+def _forget_execution_when_done(sid: str, job_id: str, task: asyncio.Task) -> None:
     if _running_executions.get(sid) is task:
         _running_executions.pop(sid, None)
+    if _execution_job_ids.get(sid) == job_id:
+        _execution_job_ids.pop(sid, None)
     _execution_progress.pop(sid, None)
+    job = _execution_jobs.get(job_id)
+    if job is not None:
+        job["finished_at"] = time.monotonic()
     if not task.cancelled():
         try:
             task.exception()
@@ -135,18 +399,38 @@ def _forget_execution_when_done(sid: str, task: asyncio.Task) -> None:
             pass
 
 
-def _get_or_start_execution(sid: str, mgr: ClassifySession) -> tuple[asyncio.Task, bool]:
+def _get_or_start_execution(sid: str, mgr: ClassifySession) -> tuple[dict, bool]:
+    _prune_finished_jobs()
     existing = _running_executions.get(sid)
     if existing and not existing.done():
-        return existing, True
+        job_id = _execution_job_ids[sid]
+        return _execution_jobs[job_id], True
+
+    job_id = str(uuid.uuid4())
+    job: dict = {
+        "job_id": job_id,
+        "sid": sid,
+        "account_id": (storage.load_session(sid) or {}).get("account_id", ""),
+        "progress": {"stage": "queued", "progress": 0.0},
+        "result": None,
+    }
 
     async def on_progress(event):
         _execution_progress[sid] = dict(event)
+        job["progress"] = dict(event)
 
-    task = asyncio.create_task(mgr.execute(sid, on_progress=on_progress))
+    async def run():
+        result = await mgr.execute(sid, on_progress=on_progress, run_id=job_id)
+        job["result"] = result
+        return result
+
+    task = asyncio.create_task(run())
+    job["task"] = task
     _running_executions[sid] = task
-    task.add_done_callback(lambda done_task: _forget_execution_when_done(sid, done_task))
-    return task, False
+    _execution_job_ids[sid] = job_id
+    _execution_jobs[job_id] = job
+    task.add_done_callback(lambda done_task: _forget_execution_when_done(sid, job_id, done_task))
+    return job, False
 
 
 def _get_or_start_refinement(
@@ -155,6 +439,7 @@ def _get_or_start_refinement(
     kind: str,
     instruction: str = "",
 ) -> tuple[dict, bool]:
+    _prune_finished_jobs()
     active_job_id = _running_refinements.get(sid)
     active_job = _refinement_jobs.get(active_job_id or "")
     if active_job and not active_job["task"].done():
@@ -180,9 +465,23 @@ def _get_or_start_refinement(
 
     async def run():
         if kind == "unclassified_retry":
-            result = await mgr.retry_unclassified(sid, on_progress=on_progress)
+            full_result = await mgr.retry_unclassified(sid, on_progress=on_progress)
+            result = {
+                "recovered": int(full_result.get("recovered") or 0),
+                "remaining": int(full_result.get("remaining") or 0),
+            }
         else:
-            result = await mgr.refine_plan(sid, instruction, on_progress=on_progress)
+            full_result = await mgr.refine_plan(sid, instruction, on_progress=on_progress)
+            active_version = next(
+                (
+                    version for version in full_result.get("versions", [])
+                    if version.get("is_active")
+                ),
+                None,
+            )
+            result = {
+                "version_id": active_version.get("version_id") if active_version else None,
+            }
         job["result"] = result
         return result
 
@@ -194,6 +493,7 @@ def _get_or_start_refinement(
     def forget(done_task: asyncio.Task) -> None:
         if _running_refinements.get(sid) == job_id:
             _running_refinements.pop(sid, None)
+        job["finished_at"] = time.monotonic()
         if not done_task.cancelled():
             try:
                 done_task.exception()
@@ -211,6 +511,7 @@ def _start_cleanup_job(
     kind: str,
     item_ids: list[int] | None = None,
 ) -> dict:
+    _prune_finished_jobs()
     job: dict = {
         "scan_id": scan_id,
         "account_id": account_id,
@@ -226,7 +527,13 @@ def _start_cleanup_job(
         if kind == "remove":
             result = await manager.remove(scan_id, account_id, item_ids or [], on_progress=on_progress)
         else:
-            result = await manager.scan(scan_id, account_id, on_progress=on_progress)
+            full_result = await manager.scan(scan_id, account_id, on_progress=on_progress)
+            scan = full_result.get("scan") or {}
+            result = {
+                "scan_id": scan_id,
+                "status": scan.get("status", "ready"),
+                "problem_total": int(scan.get("problem_total") or 0),
+            }
         job["result"] = result
         return result
 
@@ -235,6 +542,7 @@ def _start_cleanup_job(
     _cleanup_jobs[scan_id] = job
 
     def consume(done_task: asyncio.Task) -> None:
+        job["finished_at"] = time.monotonic()
         if not done_task.cancelled():
             try:
                 done_task.exception()
@@ -265,14 +573,29 @@ def _has_complete_ai_config(cfg: dict | None) -> bool:
 
 
 def get_ai() -> AiClassifier:
+    global _ai_classifier, _ai_signature
     cfg = storage.load_config()
     if not _has_complete_ai_config(cfg):
         raise BibiError("请先在设置页填写完整的 AI 配置", code="AI_NOT_CONFIGURED")
-    return AiClassifier(cfg["ai_base_url"], cfg["ai_api_key"], cfg["ai_model"])
+    signature = (cfg["ai_base_url"], cfg["ai_api_key"], cfg["ai_model"])
+    if _ai_classifier is None or _ai_signature != signature:
+        previous = _ai_classifier
+        _ai_classifier = AiClassifier(*signature)
+        _ai_signature = signature
+        if previous is not None:
+            close_result = previous.aclose()
+            if inspect.isawaitable(close_result):
+                try:
+                    asyncio.get_running_loop().create_task(close_result)
+                except RuntimeError:
+                    close_result.close()
+    return _ai_classifier
 
 
 def get_session_mgr() -> ClassifySession:
-    return ClassifySession(storage, get_bili(), get_ai())
+    cfg = storage.load_config()
+    ai = get_ai() if _has_complete_ai_config(cfg) else None
+    return ClassifySession(storage, get_bili(), ai)
 
 
 def get_cleanup_manager() -> CleanupManager:
@@ -286,44 +609,142 @@ def _active_account_id() -> str:
     return str(account["account_id"])
 
 
+def _require_owned_session(sid: str) -> dict:
+    account_id = _active_account_id()
+    session = storage.load_session_for_account(sid, account_id)
+    if not session:
+        raise BibiError("会话不存在或不属于当前账号", code="SESSION_NOT_FOUND")
+    return session
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    if _has_complete_ai_config(storage.load_config()):
-        ClassifySession(storage, get_bili(), get_ai()).resume_on_startup()
-    webbrowser.open("http://127.0.0.1:8765")
-    yield
+    get_session_mgr().resume_on_startup()
+    settings = _resolve_bind_settings()
+    browser_url = f"http://127.0.0.1:{settings.port}"
+    if settings.lan_auth_enabled:
+        browser_url += f"/?access_token={settings.token}"
+    if os.getenv("BIBITOOL_NO_BROWSER") != "1":
+        webbrowser.open(browser_url)
+    try:
+        yield
+    finally:
+        await _shutdown_runtime()
 
 
 app = FastAPI(lifespan=lifespan)
 
 
-class ConfigIn(BaseModel):
-    ai_base_url: str
-    ai_api_key: str
-    ai_model: str
-    default_privacy: int = 1
+def _with_security_headers(response):
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'self'; img-src 'self' https: data:; "
+        "style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; "
+        "connect-src 'self'; object-src 'none'; frame-ancestors 'none'",
+    )
+    return response
+
+
+@app.middleware("http")
+async def enforce_local_access(request: Request, call_next):
+    settings = _resolve_bind_settings()
+    request_host = (request.url.hostname or "").strip("[]").lower()
+    if request_host not in settings.allowed_hosts:
+        return _with_security_headers(PlainTextResponse("Host 不在允许列表中", status_code=400))
+
+    if settings.lan_auth_enabled:
+        query_token = request.query_params.get("access_token", "")
+        if request.method == "GET" and request.url.path == "/" and query_token:
+            if not hmac.compare_digest(query_token, settings.token):
+                return _with_security_headers(PlainTextResponse("访问令牌无效", status_code=401))
+            response = RedirectResponse(url="/", status_code=303)
+            response.set_cookie(
+                ACCESS_COOKIE_NAME,
+                settings.token,
+                max_age=24 * 60 * 60,
+                httponly=True,
+                samesite="strict",
+            )
+            return _with_security_headers(response)
+
+        cookie_token = request.cookies.get(ACCESS_COOKIE_NAME, "")
+        if not cookie_token or not hmac.compare_digest(cookie_token, settings.token):
+            if request.url.path.startswith("/api/"):
+                return _with_security_headers(JSONResponse(
+                    {"code": "UNAUTHORIZED", "message": "请先使用配对链接访问 BiBiTool"},
+                    status_code=401,
+                ))
+            return _with_security_headers(PlainTextResponse("请先使用配对链接访问 BiBiTool", status_code=401))
+
+    if request.method not in {"GET", "HEAD", "OPTIONS"}:
+        origin = request.headers.get("origin")
+        if origin:
+            origin_parts = urlsplit(origin)
+            if (origin_parts.hostname or "").lower() != request_host:
+                return _with_security_headers(JSONResponse(
+                    {"code": "ORIGIN_FORBIDDEN", "message": "拒绝跨站写操作"},
+                    status_code=403,
+                ))
+
+    return _with_security_headers(await call_next(request))
+
+
+class ApiInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+
+def _dedupe_positive_ids(values: list[int]) -> list[int]:
+    if any(int(value) <= 0 for value in values):
+        raise ValueError("ID 必须是正整数")
+    return list(dict.fromkeys(int(value) for value in values))
+
+
+class ConfigIn(ApiInput):
+    ai_base_url: str = Field(max_length=2048)
+    ai_api_key: str = Field(max_length=4096)
+    ai_model: str = Field(max_length=200)
     ai_batch_size: int = Field(default=100, ge=10, le=200)
 
 
-class SessionIn(BaseModel):
-    source_fids: list[int] | None = None
-    source_fid: int | None = None
-    mode: str = "quick"
+class SessionIn(ApiInput):
+    source_fids: list[int] | None = Field(default=None, max_length=100)
+    source_fid: int | None = Field(default=None, gt=0)
+    mode: Literal["quick", "full"] = "quick"
     category_limit: int = Field(default=14, ge=3, le=50)
+
+    @field_validator("source_fids")
+    @classmethod
+    def validate_source_fids(cls, value):
+        return _dedupe_positive_ids(value) if value is not None else None
+
+    @model_validator(mode="after")
+    def require_source(self):
+        if not self.source_fids and self.source_fid is None:
+            raise ValueError("请至少选择一个收藏夹")
+        return self
 
     def normalized_source_fids(self) -> list[int]:
         if self.source_fids:
-            return self.source_fids
+            return list(self.source_fids)
         if self.source_fid is not None:
             return [self.source_fid]
         return []
 
 
-class AdjustIn(BaseModel):
-    resource_id: int | None = None
-    avid: int | None = None
-    resource_type: int = 2
-    new_category: str
+class AdjustIn(ApiInput):
+    resource_id: int | None = Field(default=None, gt=0)
+    avid: int | None = Field(default=None, gt=0)
+    resource_type: int = Field(default=2, gt=0, le=1000)
+    new_category: str = Field(min_length=1, max_length=20)
+
+    @model_validator(mode="after")
+    def require_resource_id(self):
+        if self.resource_id is None and self.avid is None:
+            raise ValueError("resource_id or avid is required")
+        return self
 
     def normalized_resource_id(self) -> int:
         if self.resource_id is not None:
@@ -333,28 +754,50 @@ class AdjustIn(BaseModel):
         raise ValueError("resource_id or avid is required")
 
 
-class RemoveSkippedIn(BaseModel):
-    item_ids: list[int]
+class RemoveSkippedIn(ApiInput):
+    item_ids: list[int] = Field(min_length=1, max_length=5000)
+
+    @field_validator("item_ids")
+    @classmethod
+    def validate_item_ids(cls, value):
+        return _dedupe_positive_ids(value)
 
 
-class RemoveCleanupIn(BaseModel):
-    item_ids: list[int]
+class RemoveCleanupIn(RemoveSkippedIn):
+    pass
 
 
-class RefineIn(BaseModel):
-    instruction: str
+class RefineIn(ApiInput):
+    instruction: str = Field(min_length=1, max_length=2000)
 
 
-class DeleteEmptyFoldersIn(BaseModel):
-    source_fids: list[int]
+class DeleteEmptyFoldersIn(ApiInput):
+    source_fids: list[int] = Field(min_length=1, max_length=100)
+
+    @field_validator("source_fids")
+    @classmethod
+    def validate_source_fids(cls, value):
+        return _dedupe_positive_ids(value)
 
 
-class DeleteFoldersIn(BaseModel):
+class DeleteFoldersIn(ApiInput):
     fids: list[int] = Field(min_length=1, max_length=100)
 
+    @field_validator("fids")
+    @classmethod
+    def validate_fids(cls, value):
+        return _dedupe_positive_ids(value)
 
-class SortFoldersIn(BaseModel):
+
+class SortFoldersIn(ApiInput):
     fids: list[int] = Field(min_length=1, max_length=100)
+
+    @field_validator("fids")
+    @classmethod
+    def validate_fids(cls, value):
+        if any(int(item) <= 0 for item in value):
+            raise ValueError("ID 必须是正整数")
+        return [int(item) for item in value]
 
 
 @app.exception_handler(BibiError)
@@ -370,6 +813,8 @@ async def api_state():
 
 @app.get("/api/runtime")
 async def api_runtime():
+    _prune_finished_jobs()
+    _prune_pending_logins()
     return {
         "pid": os.getpid(),
         "started_at": STARTED_AT,
@@ -403,9 +848,15 @@ async def api_qrcode_poll(qrcode_key: str):
 
 @app.post("/api/logout")
 async def api_logout():
-    client = get_bili()
     active = storage.get_active_account()
+    if active:
+        _ensure_account_tasks_idle(str(active["account_id"]))
+    client = get_bili()
     client.clear_cookies()
+    await _close_bili_client(client)
+    for key, cached in list(_bili_clients.items()):
+        if cached is client:
+            _bili_clients.pop(key, None)
     if active:
         if active.get("cookie_path"):
             cookie_file = BASE_DIR / active["cookie_path"]
@@ -422,8 +873,9 @@ async def api_accounts():
 
 @app.post("/api/accounts/{account_id}/switch")
 async def api_switch_account(account_id: str):
-    if _running_pipelines or _running_executions:
-        raise BibiError("有整理任务正在运行，请完成或取消后再切换账号", code="PIPELINE_RUNNING")
+    active = storage.get_active_account()
+    if active and str(active["account_id"]) != account_id:
+        _ensure_account_tasks_idle(str(active["account_id"]))
     storage.activate_account(account_id)
     return {"ok": True}
 
@@ -431,13 +883,14 @@ async def api_switch_account(account_id: str):
 @app.post("/api/accounts/login/start")
 async def api_account_login_start():
     """新增账号扫码登录：使用独立临时 cookie 文件，避免覆盖当前活跃账号。"""
+    _prune_pending_logins()
     import uuid
     login_id = uuid.uuid4().hex
     temp_cookie_path = BASE_DIR / f"accounts/_pending/{login_id}.json"
     temp_cookie_path.parent.mkdir(parents=True, exist_ok=True)
     temp_client = BilibiliClient(cookie_store_path=temp_cookie_path)
     data = await temp_client.qrcode_generate()
-    _pending_logins[login_id] = temp_client
+    _register_pending_login(login_id, temp_client)
     img = qrcode.make(data["url"])
     buf = io.BytesIO()
     img.save(buf, format="PNG")
@@ -447,6 +900,13 @@ async def api_account_login_start():
         "qrcode_key": data["qrcode_key"],
         "image": f"data:image/png;base64,{b64}",
     }
+
+
+@app.post("/api/accounts/login/{login_id}/cancel")
+async def api_cancel_account_login(login_id: str):
+    existed = login_id in _pending_logins
+    _discard_pending_login(login_id)
+    return {"ok": True, "cancelled": existed}
 
 
 @app.get("/api/accounts/login/poll")
@@ -460,13 +920,9 @@ async def api_account_login_poll(login_id: str, qrcode_key: str):
         try:
             await _save_account_from_login(temp_client)
         finally:
-            # 清理临时 cookie 文件和会话
-            try:
-                if temp_client.cookie_store_path and temp_client.cookie_store_path.exists():
-                    temp_client.cookie_store_path.unlink()
-            except Exception:
-                pass
-            _pending_logins.pop(login_id, None)
+            _discard_pending_login(login_id)
+    elif result.get("status") in {"expired", "cancelled", "failed"}:
+        _discard_pending_login(login_id)
     return result
 
 
@@ -479,13 +935,13 @@ async def api_get_config():
         "configured": True,
         "ai_base_url": cfg["ai_base_url"],
         "ai_model": cfg["ai_model"],
-        "default_privacy": cfg.get("default_privacy", 1),
         "ai_batch_size": int(cfg.get("ai_batch_size", 100)),
     }
 
 
 @app.post("/api/config")
 async def api_save_config(cfg: ConfigIn):
+    global _ai_classifier, _ai_signature
     saved = cfg.model_dump()
     existing = storage.load_config() or {}
     saved["ai_base_url"] = saved["ai_base_url"].strip()
@@ -496,6 +952,12 @@ async def api_save_config(cfg: ConfigIn):
             "请填写完整的 AI 配置（Base URL、API Key 和模型名称）",
             code="AI_NOT_CONFIGURED",
         )
+    new_signature = (saved["ai_base_url"], saved["ai_api_key"], saved["ai_model"])
+    if _ai_classifier is not None and _ai_signature != new_signature:
+        previous = _ai_classifier
+        _ai_classifier = None
+        _ai_signature = None
+        await _close_bili_client(previous)
     storage.save_config(saved)
     return {"ok": True}
 
@@ -512,6 +974,27 @@ async def api_folders():
     return {"folders": folders}
 
 
+async def _confirm_folder_state(client: BilibiliClient, predicate) -> list[dict]:
+    latest: list[dict] | None = None
+    last_error: Exception | None = None
+    for delay in (0, 0.5, 1.0, 2.0):
+        if delay:
+            await asyncio.sleep(delay)
+        try:
+            latest = await client.get_my_folders(storage=storage)
+        except Exception as exc:
+            last_error = exc
+            continue
+        if predicate(latest):
+            return latest
+    if latest is None:
+        raise BibiError(
+            f"操作已经提交，但暂时无法从 B 站确认结果：{last_error}",
+            code="FOLDER_STATE_CONFIRM_FAILED",
+        )
+    return latest
+
+
 @app.post("/api/folders/sort")
 async def api_sort_folders(payload: SortFoldersIn):
     requested = [int(fid) for fid in payload.fids]
@@ -526,7 +1009,10 @@ async def api_sort_folders(payload: SortFoldersIn):
         )
 
     await client.sort_folders(requested)
-    latest = await client.get_my_folders(storage=storage)
+    latest = await _confirm_folder_state(
+        client,
+        lambda items: [int(item["fid"]) for item in items] == requested,
+    )
     confirmed_ids = [int(item["fid"]) for item in latest]
     if confirmed_ids != requested:
         raise BibiError(
@@ -538,7 +1024,7 @@ async def api_sort_folders(payload: SortFoldersIn):
 
 @app.post("/api/folders/batch-delete")
 async def api_batch_delete_folders(payload: DeleteFoldersIn):
-    if _running_pipelines or _running_executions:
+    if _has_running_tasks():
         raise BibiError("有整理任务正在运行，请等待任务完成后再删除收藏夹", code="PIPELINE_RUNNING")
 
     fids = list(dict.fromkeys(int(fid) for fid in payload.fids))
@@ -559,7 +1045,11 @@ async def api_batch_delete_folders(payload: DeleteFoldersIn):
         raise BibiError("部分收藏夹已不为空，请刷新后重新选择", code="FOLDER_NOT_EMPTY")
 
     await client.delete_folders(fids)
-    latest = await client.get_my_folders(storage=storage)
+    target_ids = set(fids)
+    latest = await _confirm_folder_state(
+        client,
+        lambda items: target_ids.isdisjoint(int(item["fid"]) for item in items),
+    )
     remaining = {int(item["fid"]) for item in latest}
     deleted_fids = [fid for fid in fids if fid not in remaining]
     failed_fids = [fid for fid in fids if fid in remaining]
@@ -576,7 +1066,7 @@ async def api_batch_delete_folders(payload: DeleteFoldersIn):
 
 @app.delete("/api/folders/{fid}")
 async def api_delete_folder(fid: int):
-    if _running_pipelines or _running_executions:
+    if _has_running_tasks():
         raise BibiError("有整理任务正在运行，请等待任务完成后再删除收藏夹", code="PIPELINE_RUNNING")
 
     client = get_bili()
@@ -590,7 +1080,10 @@ async def api_delete_folder(fid: int):
         raise BibiError("该收藏夹不为空，不能直接删除", code="FOLDER_NOT_EMPTY")
 
     await client.delete_folders([fid])
-    latest = await client.get_my_folders(storage=storage)
+    latest = await _confirm_folder_state(
+        client,
+        lambda items: all(int(item["fid"]) != fid for item in items),
+    )
     if any(int(item["fid"]) == fid for item in latest):
         raise BibiError("B站尚未确认删除该收藏夹，请稍后重试", code="FOLDER_DELETE_NOT_CONFIRMED")
     return {"ok": True, "fid": fid}
@@ -730,6 +1223,7 @@ async def api_cancel_cleanup_scan(scan_id: str):
 
 @app.post("/api/session")
 async def api_create_session(payload: SessionIn):
+    _active_account_id()
     source_fids = payload.normalized_source_fids()
     if not source_fids:
         raise BibiError("请至少选择一个收藏夹", code="NO_SOURCE_FOLDER")
@@ -740,12 +1234,14 @@ async def api_create_session(payload: SessionIn):
 
 @app.get("/api/session/{sid}")
 async def api_get_session(sid: str):
+    _require_owned_session(sid)
     mgr = get_session_mgr()
     return mgr.get_plan(sid)
 
 
 @app.get("/api/session/{sid}/stream")
 async def api_session_stream(sid: str):
+    _require_owned_session(sid)
     mgr = get_session_mgr()
     queue: asyncio.Queue = asyncio.Queue()
 
@@ -801,6 +1297,7 @@ async def api_session_stream(sid: str):
 
 @app.post("/api/session/{sid}/cancel")
 async def api_cancel_session(sid: str):
+    _require_owned_session(sid)
     mgr = get_session_mgr()
     mgr.cancel(sid)
     task = _running_pipelines.get(sid)
@@ -811,49 +1308,44 @@ async def api_cancel_session(sid: str):
 
 @app.post("/api/session/{sid}/adjust")
 async def api_adjust(sid: str, payload: AdjustIn):
+    _require_owned_session(sid)
     mgr = get_session_mgr()
     mgr.adjust_item(sid, payload.normalized_resource_id(), payload.new_category, resource_type=payload.resource_type)
     return {"ok": True}
 
 
+@app.get("/api/session/{sid}/execute/active")
+async def api_active_execution(sid: str):
+    _require_owned_session(sid)
+    job_id = _execution_job_ids.get(sid)
+    job = _execution_jobs.get(job_id or "")
+    if not job or job["task"].done():
+        return {"job_id": None, "running": False}
+    return {
+        "job_id": job_id,
+        "running": True,
+        "progress": job.get("progress") or {},
+    }
+
+
 @app.get("/api/session/{sid}/execute/stream")
-async def api_execute_stream(sid: str):
-    mgr = get_session_mgr()
+async def api_execute_stream(sid: str, job_id: str = Query(...)):
+    _require_owned_session(sid)
 
     async def event_gen():
-        session = storage.load_session(sid)
-        if not session:
-            payload = {"message": "会话不存在", "code": "NOT_FOUND"}
-            yield f"event: fail\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
-            return
-
-        status = session["status"]
-        if status == "done":
-            payload = {"stage": "done", "stats": _load_session_stats(session)}
-            yield f"event: done\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
-            return
-        if status == "pending_review":
-            task, _ = _get_or_start_execution(sid, mgr)
-        elif status == "executing":
-            task = _running_executions.get(sid)
-            if not task or task.done():
-                payload = {
-                    "message": "执行任务已中断，请重启程序后检查该任务状态",
-                    "code": "EXECUTION_NOT_RUNNING",
-                }
-                yield f"event: fail\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
-                return
-        else:
+        job = _execution_jobs.get(job_id)
+        if not job or job.get("sid") != sid:
             payload = {
-                "message": "当前会话状态不可执行",
-                "code": "INVALID_SESSION_STATE",
+                "message": "执行任务不存在或未运行",
+                "code": "EXECUTION_NOT_RUNNING",
             }
             yield f"event: fail\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
             return
+        task = job["task"]
 
         last_event = None
         while not task.done():
-            latest = _execution_progress.get(sid)
+            latest = job.get("progress")
             if latest is not None and latest != last_event:
                 last_event = dict(latest)
                 yield f"event: stage\ndata: {json.dumps(latest, ensure_ascii=False)}\n\n"
@@ -879,31 +1371,40 @@ async def api_execute_stream(sid: str):
 
 @app.post("/api/session/{sid}/execute")
 async def api_execute(sid: str):
+    session = _require_owned_session(sid)
+    if session["status"] not in ("pending_review", "executing"):
+        raise BibiError("当前会话状态不可执行", code="INVALID_SESSION_STATE")
     mgr = get_session_mgr()
-    task, _ = _get_or_start_execution(sid, mgr)
-    stats = await asyncio.shield(task)
-    return {"stats": stats}
+    job, reused = _get_or_start_execution(sid, mgr)
+    return JSONResponse(
+        {"job_id": job["job_id"], "reused": reused},
+        status_code=202,
+    )
 
 
 @app.get("/api/session/{sid}/failed-items")
 async def api_failed_items(sid: str):
+    _require_owned_session(sid)
     mgr = get_session_mgr()
     return {"items": mgr.get_failed_items(sid)}
 
 
 @app.get("/api/session/{sid}/skipped-items")
 async def api_skipped_items(sid: str):
+    _require_owned_session(sid)
     return {"items": storage.list_skipped_items(sid)}
 
 
 @app.post("/api/session/{sid}/skipped-items/remove")
 async def api_remove_skipped_items(sid: str, payload: RemoveSkippedIn):
+    _require_owned_session(sid)
     mgr = get_session_mgr()
     return {"stats": await mgr.remove_skipped_items(sid, payload.item_ids)}
 
 
 @app.post("/api/session/{sid}/retry-failed")
 async def api_retry_failed(sid: str):
+    _require_owned_session(sid)
     mgr = get_session_mgr()
     stats = await mgr.retry_failed(sid)
     return {"stats": stats}
@@ -911,8 +1412,8 @@ async def api_retry_failed(sid: str):
 
 @app.post("/api/session/{sid}/refine")
 async def api_refine_plan(sid: str, payload: RefineIn):
+    session = _require_owned_session(sid)
     mgr = get_session_mgr()
-    session = storage.load_session(sid)
     if not session or session["status"] != "pending_review":
         raise BibiError("仅预览状态可微调方案", code="INVALID_SESSION_STATE")
     job, reused = _get_or_start_refinement(sid, mgr, "refine", payload.instruction)
@@ -924,8 +1425,8 @@ async def api_refine_plan(sid: str, payload: RefineIn):
 
 @app.post("/api/session/{sid}/retry-unclassified")
 async def api_retry_unclassified(sid: str):
+    session = _require_owned_session(sid)
     mgr = get_session_mgr()
-    session = storage.load_session(sid)
     if not session or session["status"] != "pending_review":
         raise BibiError("仅预览状态可重试未分类条目", code="INVALID_SESSION_STATE")
     job, reused = _get_or_start_refinement(sid, mgr, "unclassified_retry")
@@ -935,8 +1436,24 @@ async def api_retry_unclassified(sid: str):
     )
 
 
+@app.get("/api/session/{sid}/refine/active")
+async def api_active_refinement(sid: str):
+    _require_owned_session(sid)
+    job_id = _running_refinements.get(sid)
+    job = _refinement_jobs.get(job_id or "")
+    if not job or job["task"].done():
+        return {"job_id": None, "running": False}
+    return {
+        "job_id": job_id,
+        "running": True,
+        "kind": job["kind"],
+        "progress": job.get("progress") or {},
+    }
+
+
 @app.get("/api/session/{sid}/refine/stream")
 async def api_refine_stream(sid: str, job_id: str = Query(...)):
+    _require_owned_session(sid)
     async def event_gen():
         job = _refinement_jobs.get(job_id)
         if not job or job["sid"] != sid:
@@ -972,6 +1489,7 @@ async def api_refine_stream(sid: str, job_id: str = Query(...)):
 
 @app.post("/api/session/{sid}/refine/cancel")
 async def api_cancel_refinement(sid: str):
+    _require_owned_session(sid)
     job_id = _running_refinements.get(sid)
     job = _refinement_jobs.get(job_id or "")
     if not job or job["task"].done():
@@ -982,25 +1500,27 @@ async def api_cancel_refinement(sid: str):
 
 @app.post("/api/session/{sid}/versions/{version_id}/activate")
 async def api_activate_version(sid: str, version_id: str):
+    _require_owned_session(sid)
     storage.activate_plan_version(sid, version_id)
     return get_session_mgr().get_plan(sid)
 
 
 @app.get("/api/session/{sid}/empty-source-folders")
 async def api_empty_source_folders(sid: str):
+    _require_owned_session(sid)
     return {"items": storage.list_empty_source_candidates(sid)}
 
 
 @app.post("/api/session/{sid}/empty-source-folders/delete")
 async def api_delete_empty_source_folders(sid: str, payload: DeleteEmptyFoldersIn):
+    _require_owned_session(sid)
     mgr = get_session_mgr()
     return {"stats": await mgr.delete_empty_source_folders(sid, payload.source_fids)}
 
 
 @app.get("/api/sessions/resumable")
 async def api_resumable():
-    if not storage.load_config():
-        return {"sessions": []}
+    _active_account_id()
     mgr = get_session_mgr()
     return {"sessions": mgr.list_resumable()}
 
@@ -1015,4 +1535,5 @@ async def index():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8765, access_log=True)
+    bind_settings = _resolve_bind_settings()
+    uvicorn.run(app, host=bind_settings.host, port=bind_settings.port, access_log=True)

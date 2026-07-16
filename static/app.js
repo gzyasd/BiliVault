@@ -2,7 +2,12 @@ const $ = (id) => document.querySelector(`[data-dom-id="${id}"]`);
 
 let currentMode = 'quick';
 let currentSid = null;
-let activeEventSource = null;
+const eventSources = {
+  pipeline: null,
+  execution: null,
+  refine: null,
+  cleanup: null,
+};
 let qrPollToken = 0;
 let currentView = 'home';
 let utilityReturnContext = null;
@@ -72,11 +77,21 @@ async function api(path, opts = {}) {
   return data;
 }
 
+function closeEventSource(slot, expected = null) {
+  const source = eventSources[slot];
+  if (!source || (expected && source !== expected)) return;
+  source.close();
+  eventSources[slot] = null;
+}
+
+function replaceEventSource(slot, source) {
+  closeEventSource(slot);
+  eventSources[slot] = source;
+  return source;
+}
+
 function cleanupPollingAndSSE() {
-  if (activeEventSource) {
-    activeEventSource.close();
-    activeEventSource = null;
-  }
+  Object.keys(eventSources).forEach(slot => closeEventSource(slot));
   qrPollToken++;
 }
 
@@ -89,6 +104,9 @@ function showView(name) {
 }
 
 function openUtilityView(name) {
+  if (currentView === 'accounts' && name !== 'accounts') {
+    void cancelAddAccountLogin();
+  }
   if (!['config', 'accounts'].includes(currentView)) {
     utilityReturnContext = { view: currentView, sid: currentSid };
   }
@@ -183,7 +201,6 @@ function loadConfig() {
           ai_base_url: $('config-base-url').value,
           ai_api_key: $('config-api-key').value,
           ai_model: $('config-model').value,
-          default_privacy: 1,
           ai_batch_size: Number($('config-ai-batch-size').value || 100),
         }),
       });
@@ -313,7 +330,7 @@ async function renderHome() {
           </div>
           <button class="btn btn-primary shrink-0" data-dom-id="resume-continue" style="height:32px;padding:0 14px;font-size:12px;">继续</button>
         </div>`;
-      $('resume-continue').onclick = () => openSession(s.session_id);
+      $('resume-continue').onclick = () => resumeSession(s);
     } else {
       resumeEl.style.display = 'none';
     }
@@ -989,9 +1006,7 @@ async function loadCleanupScan(scanId, defaultSelect = false) {
 }
 
 function startCleanupStream(scanId) {
-  if (activeEventSource) activeEventSource.close();
-  const es = new EventSource(`/api/cleanup/scans/${scanId}/stream`);
-  activeEventSource = es;
+  const es = replaceEventSource('cleanup', new EventSource(`/api/cleanup/scans/${scanId}/stream`));
   es.addEventListener('stage', event => {
     const data = JSON.parse(event.data);
     if (cleanupState.scan) cleanupState.scan.status = data.stage;
@@ -999,8 +1014,7 @@ function startCleanupStream(scanId) {
     updateCleanupSelectionUi();
   });
   es.addEventListener('done', async () => {
-    es.close();
-    if (activeEventSource === es) activeEventSource = null;
+    closeEventSource('cleanup', es);
     try {
       await loadCleanupScan(scanId);
     } catch (error) {
@@ -1009,8 +1023,7 @@ function startCleanupStream(scanId) {
   });
   const handleEnd = event => {
     const data = JSON.parse(event.data);
-    es.close();
-    if (activeEventSource === es) activeEventSource = null;
+    closeEventSource('cleanup', es);
     if (cleanupState.scan) cleanupState.scan.status = 'failed';
     updateCleanupProgress({ stage: 'failed', progress: 0 });
     updateCleanupSelectionUi();
@@ -1018,14 +1031,13 @@ function startCleanupStream(scanId) {
   };
   es.addEventListener('failed', handleEnd);
   es.addEventListener('cancelled', event => {
-    es.close();
-    if (activeEventSource === es) activeEventSource = null;
+    closeEventSource('cleanup', es);
     if (cleanupState.scan) cleanupState.scan.status = 'cancelled';
     updateCleanupProgress({ stage: 'cancelled', progress: 0 });
     showCleanupError(JSON.parse(event.data).message || '\u626b\u63cf\u5df2\u53d6\u6d88');
   });
   es.onerror = () => {
-    if (es.readyState === EventSource.CLOSED && activeEventSource === es) {
+    if (es.readyState === EventSource.CLOSED && eventSources.cleanup === es) {
       showCleanupError('\u8fdb\u5ea6\u8fde\u63a5\u5df2\u5173\u95ed\uff0c\u8bf7\u8fd4\u56de\u9996\u9875\u540e\u91cd\u65b0\u8fdb\u5165');
     }
   };
@@ -1351,20 +1363,17 @@ function runPipeline(sid, { reset = true } = {}) {
     $('progress-status').textContent = '正在恢复整理进度...';
   }
 
-  const es = new EventSource(`/api/session/${sid}/stream`);
-  activeEventSource = es;
+  const es = replaceEventSource('pipeline', new EventSource(`/api/session/${sid}/stream`));
   es.addEventListener('stage', e => {
     const d = JSON.parse(e.data);
     updateProgress(d);
   });
   es.addEventListener('done', () => {
-    es.close();
-    activeEventSource = null;
+    closeEventSource('pipeline', es);
     openSession(sid);
   });
   es.addEventListener('fail', e => {
-    es.close();
-    activeEventSource = null;
+    closeEventSource('pipeline', es);
     const d = JSON.parse(e.data);
     if (d.code === 'CANCELLED') {
       showView('home');
@@ -1387,12 +1396,10 @@ function runPipeline(sid, { reset = true } = {}) {
   });
   es.onerror = () => {
     if (es.readyState === EventSource.CLOSED) return;
-    es.close();
-    activeEventSource = null;
+    closeEventSource('pipeline', es);
   };
   $('progress-back-home').onclick = () => {
-    es.close();
-    activeEventSource = null;
+    closeEventSource('pipeline', es);
     showView('home');
     renderHome();
   };
@@ -1400,8 +1407,7 @@ function runPipeline(sid, { reset = true } = {}) {
     if (!confirm('确认取消本次整理？已分类的进度将丢弃。')) return;
     try {
       await api(`/api/session/${sid}/cancel`, { method: 'POST' });
-      es.close();
-      activeEventSource = null;
+      closeEventSource('pipeline', es);
       showView('home');
       renderHome();
     } catch (e) { alert(e.message); }
@@ -1634,50 +1640,74 @@ async function startRefineJob(sid, kind = 'refine') {
       ...(kind === 'refine' ? { body: JSON.stringify({ instruction: lastRefineInstruction }) } : {}),
     });
     activeRefineJob = job.job_id;
-    const es = new EventSource(`/api/session/${sid}/refine/stream?job_id=${encodeURIComponent(job.job_id)}`);
-    activeEventSource = es;
-    es.addEventListener('stage', event => {
-      const data = JSON.parse(event.data);
-      renderRefineProgress(sid, job.kind || kind, data);
-    });
-    es.addEventListener('done', event => {
-      const data = JSON.parse(event.data);
-      es.close();
-      if (activeEventSource === es) activeEventSource = null;
-      clearRefineJobState();
-      const retryResult = data.kind === 'unclassified_retry' ? data.result : null;
-      const plan = retryResult ? retryResult.plan : data.result;
-      if (retryResult) {
-        refineNotice = retryResult.recovered
-          ? `\u5df2\u6062\u590d ${retryResult.recovered} \u6761\uff0c\u4ecd\u6709 ${retryResult.remaining || 0} \u6761\u672a\u5206\u7c7b`
-          : '\u672c\u6b21\u6ca1\u6709\u6062\u590d\u65b0\u6761\u76ee\uff0c\u672a\u521b\u5efa\u7a7a\u65b9\u6848';
-      } else {
-        refineNotice = '\u65b0\u65b9\u6848\u5df2\u751f\u6210';
-      }
-      renderReview(sid, plan);
-    });
-    const handleFailure = event => {
-      const data = JSON.parse(event.data);
-      es.close();
-      if (activeEventSource === es) activeEventSource = null;
-      clearRefineJobState();
-      renderRefinePanel(sid, data.message || '\u751f\u6210\u65b9\u6848\u5931\u8d25');
-    };
-    es.addEventListener('failed', handleFailure);
-    es.addEventListener('cancelled', event => {
-      es.close();
-      if (activeEventSource === es) activeEventSource = null;
-      clearRefineJobState();
-      renderRefinePanel(sid, JSON.parse(event.data).message || '\u4efb\u52a1\u5df2\u53d6\u6d88');
-    });
-    es.onerror = () => {
-      if (es.readyState === EventSource.CLOSED && activeRefineJob) {
-        clearRefineJobState();
-        renderRefinePanel(sid, '\u8fdb\u5ea6\u8fde\u63a5\u5df2\u5173\u95ed\uff0c\u53ef\u91cd\u8bd5\u8fde\u63a5');
-      }
-    };
+    connectRefineStream(sid, job.job_id, job.kind || kind);
   } catch (error) {
     clearRefineJobState();
+    renderRefinePanel(sid, error.message);
+  }
+}
+
+function resumeSession(session) {
+  currentSid = session.session_id;
+  if (['draft', 'collecting', 'classifying', 'failed'].includes(session.status)) {
+    showView('progress');
+    runPipeline(session.session_id, { reset: false });
+    return;
+  }
+  openSession(session.session_id);
+}
+
+function connectRefineStream(sid, jobId, kind) {
+  activeRefineJob = jobId;
+  activeRefineKind = kind;
+  const es = replaceEventSource('refine', new EventSource(`/api/session/${sid}/refine/stream?job_id=${encodeURIComponent(jobId)}`));
+  es.addEventListener('stage', event => {
+    renderRefineProgress(sid, kind, JSON.parse(event.data));
+  });
+  es.addEventListener('done', async event => {
+    const data = JSON.parse(event.data);
+    closeEventSource('refine', es);
+    clearRefineJobState();
+    const retryResult = data.kind === 'unclassified_retry' ? (data.result || {}) : null;
+    if (retryResult) {
+      refineNotice = retryResult.recovered
+        ? `\u5df2\u6062\u590d ${retryResult.recovered} \u6761\uff0c\u4ecd\u6709 ${retryResult.remaining || 0} \u6761\u672a\u5206\u7c7b`
+        : '\u672c\u6b21\u6ca1\u6709\u6062\u590d\u65b0\u6761\u76ee\uff0c\u672a\u521b\u5efa\u7a7a\u65b9\u6848';
+    } else {
+      refineNotice = '\u65b0\u65b9\u6848\u5df2\u751f\u6210';
+    }
+    try {
+      await openSession(sid);
+    } catch (error) {
+      renderRefinePanel(sid, error.message || '\u65e0\u6cd5\u52a0\u8f7d\u65b0\u65b9\u6848');
+    }
+  });
+  const handleFailure = event => {
+    const data = JSON.parse(event.data);
+    closeEventSource('refine', es);
+    clearRefineJobState();
+    renderRefinePanel(sid, data.message || '\u751f\u6210\u65b9\u6848\u5931\u8d25');
+  };
+  es.addEventListener('failed', handleFailure);
+  es.addEventListener('cancelled', event => {
+    closeEventSource('refine', es);
+    clearRefineJobState();
+    renderRefinePanel(sid, JSON.parse(event.data).message || '\u4efb\u52a1\u5df2\u53d6\u6d88');
+  });
+  es.onerror = () => {
+    if (es.readyState === EventSource.CLOSED && activeRefineJob === jobId) {
+      renderRefinePanel(sid, '\u8fdb\u5ea6\u8fde\u63a5\u5df2\u5173\u95ed\uff0c\u8fd4\u56de\u672c\u9875\u65f6\u5c06\u81ea\u52a8\u6062\u590d');
+    }
+  };
+}
+
+async function restoreRefineJob(sid) {
+  try {
+    const active = await api(`/api/session/${sid}/refine/active`);
+    if (!active.running || !active.job_id) return;
+    renderRefineProgress(sid, active.kind, active.progress || {});
+    connectRefineStream(sid, active.job_id, active.kind);
+  } catch (error) {
     renderRefinePanel(sid, error.message);
   }
 }
@@ -1839,7 +1869,9 @@ function updateExecutionProgress(data) {
   const percent = Math.max(0, Math.min(100, Math.round(ratio * 100)));
 
   let status = '正在执行整理方案';
-  if (data.phase === 'creating_folders') {
+  if (data.phase === 'reconciling') {
+    status = '正在核验上次执行进度';
+  } else if (data.phase === 'creating_folders') {
     const created = Number(data.folders_created || 0);
     const folderTotal = Number(data.folders_total || 0);
     status = folderTotal ? `正在创建目标收藏夹（${created}/${folderTotal}）` : '正在准备目标收藏夹';
@@ -1856,8 +1888,8 @@ function updateExecutionProgress(data) {
   $('execution-failed').textContent = failed;
 }
 
-function startExecutionProgress(sid) {
-  if (activeEventSource) activeEventSource.close();
+async function startExecutionProgress(sid, jobId = null) {
+  closeEventSource('execution');
   isExecuting = true;
   setExecutionProgressVisible(true);
   updateExecutionProgress({
@@ -1869,22 +1901,30 @@ function startExecutionProgress(sid) {
     failed: 0,
   });
 
-  const es = new EventSource(`/api/session/${sid}/execute/stream`);
-  activeEventSource = es;
+  try {
+    if (!jobId) {
+      const job = await api(`/api/session/${sid}/execute`, { method: 'POST' });
+      jobId = job.job_id;
+    }
+  } catch (error) {
+    isExecuting = false;
+    $('execution-status').textContent = `\u6267\u884c\u5f02\u5e38\uff1a${error.message}`;
+    return;
+  }
+
+  const es = replaceEventSource('execution', new EventSource(`/api/session/${sid}/execute/stream?job_id=${encodeURIComponent(jobId)}`));
   es.addEventListener('stage', event => {
     updateExecutionProgress(JSON.parse(event.data));
   });
   es.addEventListener('done', event => {
     const data = JSON.parse(event.data || '{}');
-    es.close();
-    if (activeEventSource === es) activeEventSource = null;
+    closeEventSource('execution', es);
     isExecuting = false;
     renderResult(sid, data.stats || {});
   });
   es.addEventListener('fail', event => {
     const data = JSON.parse(event.data || '{}');
-    es.close();
-    if (activeEventSource === es) activeEventSource = null;
+    closeEventSource('execution', es);
     isExecuting = false;
     $('execution-status').textContent = `执行异常：${data.message || '未知错误'}`;
     alert(data.message || '执行失败');
@@ -1900,6 +1940,21 @@ function startExecutionProgress(sid) {
     showView('home');
     renderHome();
   };
+}
+
+async function restoreExecutionProgress(sid) {
+  try {
+    const active = await api(`/api/session/${sid}/execute/active`);
+    if (active.running && active.job_id) {
+      if (active.progress) updateExecutionProgress(active.progress);
+      startExecutionProgress(sid, active.job_id);
+      return;
+    }
+    isExecuting = false;
+    setExecutionProgressVisible(false);
+  } catch (error) {
+    $('execution-status').textContent = `\u65e0\u6cd5\u6062\u590d\u6267\u884c\u8fdb\u5ea6\uff1a${error.message}`;
+  }
 }
 
 async function renderReview(sid, plan) {
@@ -2017,7 +2072,12 @@ async function renderReview(sid, plan) {
     } catch (e) { alert(e.message); }
   };
 
-  if (isExecuting) startExecutionProgress(sid);
+  if (isExecuting) restoreExecutionProgress(sid);
+  if (activeRefineJob && !eventSources.refine) {
+    restoreRefineJob(sid);
+  } else if (!activeRefineJob) {
+    restoreRefineJob(sid);
+  }
 }
 
 async function adjustItem(sid, resourceId, resourceType, newCat) {
@@ -2127,7 +2187,10 @@ async function renderResult(sid, stats) {
 
 $('nav-settings').onclick = () => openUtilityView('config');
 $('nav-account').onclick = () => openUtilityView('accounts');
-$('accounts-back').onclick = returnFromUtilityView;
+$('accounts-back').onclick = async () => {
+  await cancelAddAccountLogin();
+  await returnFromUtilityView();
+};
 $('account-logout').onclick = logoutAccount;
 
 async function logoutAccount() {
@@ -2204,8 +2267,21 @@ async function renderAccounts() {
 let addAccountLoginId = null;
 let addAccountQrToken = 0;
 
+async function cancelAddAccountLogin() {
+  addAccountQrToken++;
+  const loginId = addAccountLoginId;
+  addAccountLoginId = null;
+  if (!loginId) return;
+  try {
+    await api(`/api/accounts/login/${encodeURIComponent(loginId)}/cancel`, { method: 'POST' });
+  } catch (_) {
+    // 登录会话可能已经完成或过期，不应阻止页面返回。
+  }
+}
+
 async function startAddAccountLogin() {
   try {
+    await cancelAddAccountLogin();
     const r = await api('/api/accounts/login/start', { method: 'POST' });
     addAccountLoginId = r.login_id;
     addAccountQrToken++;
@@ -2227,6 +2303,7 @@ async function pollAddAccountLogin(qrcode_key, myToken) {
       const r = await api(`/api/accounts/login/poll?login_id=${encodeURIComponent(addAccountLoginId)}&qrcode_key=${encodeURIComponent(qrcode_key)}`);
       if (r.status === 'success') {
         addAccountQrToken++;
+        addAccountLoginId = null;
         resetUtilityReturnAfterAccountChange();
         alert('添加账号成功');
         renderAccounts();
@@ -2234,6 +2311,7 @@ async function pollAddAccountLogin(qrcode_key, myToken) {
       }
       if (r.status === 'expired' || r.status === 'failed') {
         addAccountQrToken++;
+        addAccountLoginId = null;
         alert('二维码已过期或失败，请重新扫码');
         $('account-add-qr').innerHTML = '';
         return;

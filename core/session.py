@@ -1,3 +1,4 @@
+import asyncio
 import inspect
 import json
 import logging
@@ -14,6 +15,7 @@ _VALID_TRANSITIONS = {
     "classifying": {"pending_review", "draft", "cancelled"},
     "pending_review": {"executing", "cancelled"},
     "executing": {"done", "pending_review"},
+    "failed": {"draft", "classifying", "cancelled"},
     "done": set(),
     "cancelled": set(),
 }
@@ -25,12 +27,27 @@ def _chunks(items: list, size: int):
 
 
 class ClassifySession:
-    def __init__(self, storage, bili_client, ai_classifier):
+    def __init__(self, storage, bili_client, ai_classifier=None):
         self.storage = storage
         self.bili = bili_client
         self.ai = ai_classifier
+        self.account_id = str(getattr(bili_client, "account_id", "") or "")
+
+    def _require_ai(self):
+        if self.ai is None:
+            raise BibiError("请先在设置页填写完整的 AI 配置", code="AI_NOT_CONFIGURED")
+        return self.ai
+
+    def _assert_bound_session(self, sid: str) -> dict | None:
+        session = self.storage.load_session(sid)
+        if session and self.account_id:
+            session_account = str(session.get("account_id") or "")
+            if session_account != self.account_id:
+                raise StateError("整理会话不属于当前 B 站账号")
+        return session
 
     def _transition(self, sid: str, current: str, target: str) -> None:
+        self._assert_bound_session(sid)
         if target not in _VALID_TRANSITIONS.get(current, set()):
             raise StateError(f"非法状态转换: {current} -> {target}")
         self.storage.update_session_status(sid, target)
@@ -51,10 +68,18 @@ class ClassifySession:
             raise NotLoggedInError()
         active_account = self.storage.get_active_account()
         account_id = active_account["account_id"] if active_account else ""
+        if self.account_id and str(account_id or "") != self.account_id:
+            raise StateError("当前 B 站客户端与已激活账号不一致")
         unique_fids: list[int] = []
         for fid in source_fids:
             if fid not in unique_fids:
                 unique_fids.append(fid)
+        if not unique_fids:
+            raise BibiError("请至少选择一个收藏夹", code="SOURCE_FOLDER_REQUIRED")
+        folders = {f["fid"]: f for f in await self.bili.get_my_folders(storage=self.storage)}
+        missing = [fid for fid in unique_fids if fid not in folders]
+        if missing:
+            raise BibiError(f"收藏夹不存在或不属于当前账号: {missing}", code="SOURCE_FOLDER_NOT_FOUND")
         sid = self.storage.create_session(
             source_fid=unique_fids[0],
             mode=mode,
@@ -62,10 +87,6 @@ class ClassifySession:
         )
         if account_id:
             self.storage.update_session_account(sid, account_id)
-        folders = {f["fid"]: f for f in await self.bili.get_my_folders(storage=self.storage)}
-        missing = [fid for fid in unique_fids if fid not in folders]
-        if missing:
-            raise BibiError(f"收藏夹不存在或不属于当前账号: {missing}", code="SOURCE_FOLDER_NOT_FOUND")
         self.storage.save_session_sources(sid, [
             {
                 "account_id": account_id,
@@ -80,20 +101,42 @@ class ClassifySession:
         return sid
 
     async def run_pipeline(self, sid: str, on_progress=None) -> None:
-        await self.collect(sid, on_progress=on_progress)
-        s = self.storage.load_session(sid)
-        if not s or s["status"] == "cancelled":
-            return
-        await self.classify(sid, on_progress=on_progress)
+        self._assert_bound_session(sid)
+        session = self.storage.load_session(sid)
+        if not session:
+            raise StateError("会话不存在")
+        if session["status"] == "failed":
+            retry_status = "classifying" if session.get("failed_stage") == "classifying" else "draft"
+            self.storage.clear_session_failure(sid, retry_status)
+            session = self.storage.load_session(sid)
+        try:
+            if session["status"] in ("draft", "collecting"):
+                await self.collect(sid, on_progress=on_progress)
+            session = self.storage.load_session(sid)
+            if not session or session["status"] == "cancelled":
+                return
+            if session["status"] == "classifying":
+                await self.classify(sid, on_progress=on_progress)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            current = self.storage.load_session(sid) or {}
+            stage = current.get("status") or "pipeline"
+            code = exc.code if isinstance(exc, BibiError) else "INTERNAL"
+            self.storage.mark_session_failed(sid, stage, str(code), str(exc))
+            raise
 
     def _is_cancelled(self, sid: str) -> bool:
         s = self.storage.load_session(sid)
         return bool(s and s["status"] == "cancelled")
 
     async def collect(self, sid: str, on_progress=None) -> None:
+        self._assert_bound_session(sid)
         s = self.storage.load_session(sid)
         if not s or s["status"] not in ("draft", "collecting"):
             raise StateError("会话不在可采集状态")
+        if s["status"] == "draft":
+            await asyncio.to_thread(self.storage.reset_session_collection, sid)
         self._transition(sid, s["status"], "collecting")
         await _emit_progress(on_progress, {"stage": "collecting", "progress": 0.0})
         sources = self.storage.list_session_sources(sid)
@@ -107,6 +150,8 @@ class ClassifySession:
         scanned = 0
         skipped = 0
         skipped_by_reason: dict[str, int] = {}
+        enrichment_tasks: dict[str, asyncio.Task] = {}
+        enrichment_semaphore = asyncio.Semaphore(5)
         for src in sources:
             source_fid = src["source_fid"]
             source_collected = 0
@@ -133,9 +178,11 @@ class ClassifySession:
                 resources = page.get("resources")
                 if resources is None:
                     resources = [{**v, "resource_id": v["avid"], "resource_type": 2} for v in page["videos"]]
-                for v in resources:
+                normalized_resources = []
+                for raw_resource in resources:
                     if self._is_cancelled(sid):
                         return
+                    v = dict(raw_resource)
                     v["fid"] = source_fid
                     resource_id = v.get("resource_id") or v.get("avid")
                     resource_type = v.get("resource_type", 2)
@@ -143,21 +190,38 @@ class ClassifySession:
                         seen_resource_keys.add((resource_id, resource_type))
                     v["avid"] = resource_id
                     v["resource_type"] = resource_type
-                    if s["mode"] == "full" and v.get("bvid"):
-                        v = await self._enrich_video(v)
-                        if self._is_cancelled(sid):
-                            return
-                        v["fid"] = source_fid
-                        v["avid"] = resource_id
-                        v["resource_type"] = resource_type
+                    normalized_resources.append(v)
+                if s["mode"] == "full":
+                    normalized_resources = list(await asyncio.gather(*[
+                        self._enrich_video(
+                            resource,
+                            cache=enrichment_tasks,
+                            semaphore=enrichment_semaphore,
+                        ) if resource.get("bvid") else asyncio.sleep(0, result=resource)
+                        for resource in normalized_resources
+                    ]))
+                if self._is_cancelled(sid):
+                    return
+                for v in normalized_resources:
+                    resource_id = v.get("resource_id") or v.get("avid")
+                    resource_type = v.get("resource_type", 2)
+                    v["fid"] = source_fid
+                    v["avid"] = resource_id
+                    v["resource_type"] = resource_type
                     v["account_id"] = s.get("account_id") or ""
                     v.setdefault("intro", "")
                     v.setdefault("tags", "[]")
-                    self.storage.upsert_video(v)
-                    self.storage.add_session_video_source(sid, resource_id=resource_id, source_fid=source_fid, resource_type=resource_type)
                 page_skipped_items = page.get("skipped_items", [])
+                if normalized_resources or page_skipped_items:
+                    await asyncio.to_thread(
+                        self.storage.save_collected_page,
+                        sid,
+                        s.get("account_id"),
+                        source_fid,
+                        normalized_resources,
+                        page_skipped_items,
+                    )
                 if page_skipped_items:
-                    self.storage.add_skipped_items(sid, s.get("account_id"), page_skipped_items)
                     for item in page_skipped_items:
                         resource_id = item.get("resource_id", item.get("avid"))
                         resource_type = item.get("resource_type", 2)
@@ -202,7 +266,7 @@ class ClassifySession:
                     if (resource["resource_id"], resource.get("resource_type", 2)) not in seen_resource_keys
                 ]
                 if hidden_resources:
-                    self.storage.add_skipped_items(sid, s.get("account_id"), [
+                    await asyncio.to_thread(self.storage.add_skipped_items, sid, s.get("account_id"), [
                         {
                             "source_fid": source_fid,
                             "avid": resource["resource_id"],
@@ -260,6 +324,8 @@ class ClassifySession:
         self._transition(sid, "collecting", "classifying")
 
     async def classify(self, sid: str, on_progress=None) -> None:
+        self._assert_bound_session(sid)
+        ai = self._require_ai()
         s = self.storage.load_session(sid)
         if not s or s["status"] != "classifying":
             raise StateError("会话不在分类状态")
@@ -295,7 +361,7 @@ class ClassifySession:
 
         results = []
         if videos:
-            results = await self.ai.classify(
+            results = await ai.classify(
                 videos,
                 batch_size=self._ai_batch_size(),
                 on_progress=ai_progress,
@@ -330,6 +396,7 @@ class ClassifySession:
         await _emit_progress(on_progress, {"stage": "pending_review", "progress": 1.0})
 
     def cancel(self, sid: str) -> None:
+        self._assert_bound_session(sid)
         s = self.storage.load_session(sid)
         if not s:
             raise StateError("会话不存在")
@@ -337,10 +404,30 @@ class ClassifySession:
             raise StateError(f"当前状态 {s['status']} 不支持取消")
         self._transition(sid, s["status"], "cancelled")
 
-    async def _enrich_video(self, video: dict) -> dict:
-        try:
-            info = await self.bili.get_video_info(video["bvid"])
-        except Exception:
+    async def _enrich_video(
+        self,
+        video: dict,
+        cache: dict[str, asyncio.Task] | None = None,
+        semaphore: asyncio.Semaphore | None = None,
+    ) -> dict:
+        async def fetch_info() -> dict:
+            try:
+                if semaphore is None:
+                    return await self.bili.get_video_info(video["bvid"])
+                async with semaphore:
+                    return await self.bili.get_video_info(video["bvid"])
+            except Exception:
+                return {}
+
+        if cache is None:
+            info = await fetch_info()
+        else:
+            task = cache.get(video["bvid"])
+            if task is None:
+                task = asyncio.create_task(fetch_info())
+                cache[video["bvid"]] = task
+            info = await task
+        if not info:
             return video
         enriched = dict(video)
         for key in ("title", "intro", "up_name", "up_mid", "cover_url", "tname"):
@@ -352,6 +439,7 @@ class ClassifySession:
         return enriched
 
     def get_plan(self, sid: str) -> dict:
+        self._assert_bound_session(sid)
         s = self.storage.load_session(sid)
         if not s:
             raise StateError("会话不存在")
@@ -378,6 +466,7 @@ class ClassifySession:
         }
 
     def adjust_item(self, sid: str, resource_id: int, new_category: str, resource_type: int = 2) -> None:
+        self._assert_bound_session(sid)
         s = self.storage.load_session(sid)
         if not s or s["status"] != "pending_review":
             raise StateError("仅预览状态可调整")
@@ -388,6 +477,8 @@ class ClassifySession:
             self.storage.adjust_classification(sid, resource_id, new_category, resource_type=resource_type)
 
     async def refine_plan(self, sid: str, instruction: str, on_progress=None) -> dict:
+        self._assert_bound_session(sid)
+        ai = self._require_ai()
         s = self.storage.load_session(sid)
         if not s or s["status"] != "pending_review":
             raise StateError("仅预览状态可微调方案")
@@ -432,7 +523,7 @@ class ClassifySession:
             latest_retry_count = int(event.get("retry_count") or latest_retry_count)
             await _emit_progress(on_progress, event)
 
-        refined = await self.ai.refine_plan(
+        refined = await ai.refine_plan(
             videos,
             current,
             instruction,
@@ -467,6 +558,8 @@ class ClassifySession:
         return self.get_plan(sid)
 
     async def retry_unclassified(self, sid: str, on_progress=None) -> dict:
+        self._assert_bound_session(sid)
+        ai = self._require_ai()
         s = self.storage.load_session(sid)
         if not s or s["status"] != "pending_review":
             raise StateError("仅预览状态可重试未分类条目")
@@ -499,7 +592,7 @@ class ClassifySession:
         async def ai_progress(event: dict):
             await _emit_progress(on_progress, {**event, "stage": "refining"})
 
-        retried = await self.ai.classify(
+        retried = await ai.classify(
             videos,
             batch_size=self._ai_batch_size(),
             on_progress=ai_progress,
@@ -539,9 +632,11 @@ class ClassifySession:
         return {"plan": self.get_plan(sid), "recovered": recovered, "remaining": remaining}
 
     def get_failed_items(self, sid: str) -> list[dict]:
+        self._assert_bound_session(sid)
         return self.storage.list_failed_items(sid)
 
     async def remove_skipped_items(self, sid: str, item_ids: list[int]) -> dict:
+        self._assert_bound_session(sid)
         s = self.storage.load_session(sid)
         if not s:
             raise StateError("会话不存在")
@@ -568,7 +663,215 @@ class ClassifySession:
                     failed += len(chunk)
         return {"success": success, "failed": failed, "total": len(removable)}
 
-    async def execute(self, sid: str, batch_size: int = 50, on_progress=None) -> dict:
+    async def execute(
+        self,
+        sid: str,
+        batch_size: int = 50,
+        on_progress=None,
+        run_id: str | None = None,
+    ) -> dict:
+        self._assert_bound_session(sid)
+        session = self.storage.load_session(sid)
+        if not session or session["status"] != "pending_review":
+            raise StateError("仅预览状态可执行")
+        active = self.storage.get_active_plan_version(sid)
+        version_id = active["version_id"] if active else None
+        existing_run = self.storage.get_execution_run(run_id) if run_id else None
+        if existing_run and existing_run["session_id"] != sid:
+            raise StateError("执行任务不属于当前会话")
+        if not existing_run:
+            run_id = self.storage.create_execution_run(
+                sid,
+                version_id=version_id,
+                account_id=session.get("account_id") or self.account_id,
+                run_id=run_id,
+            )
+        self.storage.update_execution_run(run_id, status="running", error="")
+        try:
+            stats = await self._execute_once(sid, batch_size, on_progress, run_id)
+        except asyncio.CancelledError:
+            self.storage.update_execution_run(run_id, status="cancelled", error="执行已取消")
+            current = self.storage.load_session(sid)
+            if current and current["status"] == "executing":
+                self.storage.update_session_status(sid, "pending_review")
+            raise
+        except Exception as exc:
+            self.storage.update_execution_run(run_id, status="failed", error=str(exc))
+            current = self.storage.load_session(sid)
+            if current and current["status"] == "executing":
+                self.storage.update_session_status(sid, "pending_review")
+            raise
+        self.storage.update_execution_run(
+            run_id,
+            status="completed",
+            processed=stats["total"],
+            total=stats["total"],
+            success=stats["success"],
+            failed=stats["failed"],
+            error="",
+        )
+        return stats
+
+    async def _recover_saved_execution_targets(
+        self,
+        sid: str,
+        version_id: str | None,
+        categories: set[str],
+    ) -> dict[str, int]:
+        recovered: dict[str, int] = {}
+        unresolved: list[tuple[str, dict, set[int]]] = []
+        for category in sorted(categories):
+            target = self.storage.get_execution_target(sid, version_id, category)
+            if not target:
+                continue
+            if target.get("target_fid") and target.get("status") == "ready":
+                recovered[category] = int(target["target_fid"])
+                continue
+            try:
+                baseline = {int(fid) for fid in json.loads(target.get("baseline_fids") or "[]")}
+            except (TypeError, ValueError, json.JSONDecodeError):
+                baseline = set()
+            if baseline and target.get("status") in {"creating", "failed"}:
+                unresolved.append((category, target, baseline))
+        if not unresolved:
+            return recovered
+        try:
+            folders = await self.bili.get_my_folders(storage=self.storage)
+        except Exception as exc:
+            logger.warning("无法核验中断前创建的目标收藏夹: %s", exc)
+            return recovered
+        for category, _, baseline in unresolved:
+            candidates = [
+                int(folder["fid"])
+                for folder in folders
+                if int(folder["fid"]) not in baseline
+                and str(folder.get("title") or "").strip() == category
+            ]
+            if len(candidates) == 1:
+                target_fid = candidates[0]
+                self.storage.save_execution_target(
+                    sid,
+                    version_id,
+                    category,
+                    target_fid,
+                    status="ready",
+                    error="",
+                    baseline_fids=sorted(baseline),
+                )
+                recovered[category] = target_fid
+            elif len(candidates) > 1:
+                self.storage.save_execution_target(
+                    sid,
+                    version_id,
+                    category,
+                    0,
+                    status="ambiguous",
+                    error="发现多个同名新收藏夹，无法安全判断执行目标",
+                    baseline_fids=sorted(baseline),
+                )
+        return recovered
+
+    async def _reconcile_remote_execution_positions(
+        self,
+        sid: str,
+        version_id: str | None,
+        items_by_key: dict[tuple[int, int], dict],
+        target_by_category: dict[str, int],
+        sources: list[dict],
+        on_progress=None,
+    ) -> int:
+        candidates = []
+        remote_fids: set[int] = set()
+        for source in sources:
+            if source.get("moved"):
+                continue
+            key = (int(source["resource_id"]), int(source.get("resource_type", 2)))
+            item = items_by_key.get(key)
+            if not item:
+                continue
+            target_fid = target_by_category.get(item.get("category", ""))
+            if not target_fid:
+                continue
+            source_fid = int(source["source_fid"])
+            candidates.append((source, item, key, source_fid, target_fid))
+            remote_fids.update((source_fid, target_fid))
+        if not candidates:
+            return 0
+
+        await _emit_progress(on_progress, {
+            "stage": "executing",
+            "phase": "reconciling",
+            "progress": 0.0,
+            "processed": 0,
+            "total": len(candidates),
+            "success": 0,
+            "failed": 0,
+        })
+
+        semaphore = asyncio.Semaphore(5)
+
+        async def load_remote(fid: int):
+            try:
+                async with semaphore:
+                    rows = await self.bili.get_folder_resource_ids(fid, storage=self.storage)
+                return fid, {
+                    (int(row.get("resource_id") or 0), int(row.get("resource_type") or 2))
+                    for row in rows
+                    if row.get("resource_id")
+                }
+            except Exception as exc:
+                logger.warning("执行恢复时无法核验收藏夹 %s: %s", fid, exc)
+                return fid, None
+
+        remote_by_fid = dict(await asyncio.gather(*[
+            load_remote(fid) for fid in sorted(remote_fids)
+        ]))
+        reconciled = 0
+        for source, item, key, source_fid, target_fid in candidates:
+            source_keys = remote_by_fid.get(source_fid)
+            target_keys = remote_by_fid.get(target_fid)
+            if source_keys is None or target_keys is None:
+                continue
+            if key in source_keys or key not in target_keys:
+                continue
+            resource_id, resource_type = key
+            self.storage.mark_session_video_source_moved(
+                sid,
+                resource_id,
+                source_fid,
+                True,
+                "",
+                resource_type=resource_type,
+            )
+            item_complete = self.storage.are_all_session_video_sources_moved(
+                sid,
+                resource_id,
+                resource_type=resource_type,
+            )
+            if version_id:
+                self.storage.mark_plan_item_executed(
+                    version_id,
+                    resource_id,
+                    item_complete,
+                    resource_type=resource_type,
+                )
+            else:
+                self.storage.mark_classification_executed(
+                    sid,
+                    resource_id,
+                    item_complete,
+                    resource_type=resource_type,
+                )
+            self.storage.delete_one_failed_item(
+                sid,
+                resource_id,
+                item.get("category", ""),
+                resource_type=resource_type,
+            )
+            reconciled += 1
+        return reconciled
+
+    async def _execute_once(self, sid: str, batch_size: int, on_progress, run_id: str) -> dict:
         s = self.storage.load_session(sid)
         if not s or s["status"] != "pending_review":
             raise StateError("仅预览状态可执行")
@@ -581,6 +884,11 @@ class ClassifySession:
         else:
             version_id = None
             items = self.storage.load_classifications(sid)
+        items_by_key = {
+            (int(item.get("resource_id", item.get("avid"))), int(item.get("resource_type", 2))): item
+            for item in items
+            if item.get("category") != "未分类"
+        }
         # 用 (resource_id, resource_type) 组合键映射 videos，避免同 ID 不同类型互相覆盖
         # 按方案项组合键查询标题，多源会话也能正确取到
         resource_keys = [
@@ -594,10 +902,28 @@ class ClassifySession:
         }
         # 构建 sources_by_key 映射；无记录时回退到会话 source_fid
         sources = self.storage.list_session_video_sources(sid)
+        existing_targets = await self._recover_saved_execution_targets(
+            sid,
+            version_id,
+            {str(item["category"]) for item in items_by_key.values()},
+        )
+        reconciled = await self._reconcile_remote_execution_positions(
+            sid,
+            version_id,
+            items_by_key,
+            existing_targets,
+            sources,
+            on_progress=on_progress,
+        )
+        if reconciled:
+            sources = self.storage.list_session_video_sources(sid)
         sources_by_key: dict[tuple[int, int], list[dict]] = {}
+        known_source_keys: set[tuple[int, int]] = set()
         for src in sources:
             key = (src["resource_id"], src.get("resource_type", 2))
-            sources_by_key.setdefault(key, []).append(src)
+            known_source_keys.add(key)
+            if not src.get("moved"):
+                sources_by_key.setdefault(key, []).append(src)
         # 按 (category, source_fid) 分组，每项为 (resource_id, resource_type)
         move_groups: dict[tuple[str, int], list[tuple[int, int]]] = {}
         for it in items:
@@ -607,16 +933,23 @@ class ClassifySession:
             resource_id = it.get("resource_id", it.get("avid"))
             resource_type = it.get("resource_type", 2)
             key = (resource_id, resource_type)
-            srcs = sources_by_key.get(key, [{"source_fid": s["source_fid"], "resource_type": resource_type}])
+            if key in known_source_keys:
+                srcs = sources_by_key.get(key, [])
+            else:
+                srcs = [{"source_fid": s["source_fid"], "resource_type": resource_type}]
             for src in srcs:
                 gkey = (cat, src["source_fid"])
                 move_groups.setdefault(gkey, []).append((resource_id, src.get("resource_type", resource_type)))
         # 为每个 category 创建目标收藏夹
-        cat_to_fid: dict[str, int] = {}
+        cat_to_fid: dict[str, int] = {
+            category: target_fid
+            for category, target_fid in existing_targets.items()
+            if any(category == pending_category for pending_category, _ in move_groups)
+        }
         categories = sorted({cat for cat, _ in move_groups.keys()})
-        total = sum(len(res_list) for res_list in move_groups.values())
-        processed = 0
-        success = 0
+        total = reconciled + sum(len(res_list) for res_list in move_groups.values())
+        processed = reconciled
+        success = reconciled
         failed = 0
         folders_created = 0
         folders_total = len(categories)
@@ -640,15 +973,60 @@ class ClassifySession:
                 "category": category,
                 "source_fid": source_fid,
             })
+            self.storage.update_execution_run(
+                run_id,
+                status="running",
+                processed=processed,
+                total=total,
+                success=success,
+                failed=failed,
+            )
 
         await emit_execution_progress("creating_folders")
+        folder_snapshot: list[dict] | None = None
         for cat in categories:
+            saved_target = self.storage.get_execution_target(sid, version_id, cat)
+            if saved_target and saved_target.get("target_fid") and saved_target.get("status") == "ready":
+                cat_to_fid[cat] = int(saved_target["target_fid"])
+                folders_created += 1
+                await emit_execution_progress("creating_folders", category=cat)
+                continue
             try:
+                if saved_target and saved_target.get("status") == "ambiguous":
+                    raise BibiError(
+                        saved_target.get("error") or "目标收藏夹状态不明确，请人工核验后重试",
+                        code="EXECUTION_TARGET_AMBIGUOUS",
+                    )
+                if folder_snapshot is None:
+                    folder_snapshot = await self.bili.get_my_folders(storage=self.storage)
+                baseline_fids = [int(folder["fid"]) for folder in folder_snapshot]
+                self.storage.save_execution_target(
+                    sid,
+                    version_id,
+                    cat,
+                    0,
+                    status="creating",
+                    error="",
+                    baseline_fids=baseline_fids,
+                )
                 cat_to_fid[cat] = await self.bili.create_folder(title=cat, privacy=1)
+                self.storage.save_execution_target(
+                    sid,
+                    version_id,
+                    cat,
+                    cat_to_fid[cat],
+                    status="ready",
+                    error="",
+                    baseline_fids=baseline_fids,
+                )
+                folder_snapshot.append({"fid": cat_to_fid[cat], "title": cat})
                 folders_created += 1
                 await emit_execution_progress("creating_folders", category=cat)
             except Exception as e:
                 err_code, err_msg = _extract_error(e)
+                self.storage.save_execution_target(
+                    sid, version_id, cat, 0, status="failed", error=err_msg
+                )
                 for (c, sf), res_list in move_groups.items():
                     if c != cat:
                         continue
@@ -690,11 +1068,14 @@ class ClassifySession:
                         resources=resources_str,
                     )
                     for resource_id, resource_type in chunk:
-                        if version_id:
-                            self.storage.mark_plan_item_executed(version_id, resource_id, True, resource_type=resource_type)
-                        else:
-                            self.storage.mark_classification_executed(sid, resource_id, True, resource_type=resource_type)
                         self.storage.mark_session_video_source_moved(sid, resource_id, sf, True, "", resource_type=resource_type)
+                        item_complete = self.storage.are_all_session_video_sources_moved(
+                            sid, resource_id, resource_type=resource_type
+                        )
+                        if version_id:
+                            self.storage.mark_plan_item_executed(version_id, resource_id, item_complete, resource_type=resource_type)
+                        else:
+                            self.storage.mark_classification_executed(sid, resource_id, item_complete, resource_type=resource_type)
                     success += len(chunk)
                 except Exception as e:
                     err_code, err_msg = _extract_error(e)
@@ -728,6 +1109,7 @@ class ClassifySession:
         return stats
 
     async def refresh_empty_source_candidates(self, sid: str) -> None:
+        self._assert_bound_session(sid)
         sources = self.storage.list_session_sources(sid)
         if not sources:
             return
@@ -750,6 +1132,7 @@ class ClassifySession:
             )
 
     async def delete_empty_source_folders(self, sid: str, source_fids: list[int]) -> dict:
+        self._assert_bound_session(sid)
         sources = {s["source_fid"]: s for s in self.storage.list_session_sources(sid)}
         folders = {f["fid"]: f for f in await self.bili.get_my_folders(storage=self.storage)}
         deletable = []
@@ -774,18 +1157,32 @@ class ClassifySession:
                 await self.bili.delete_folders(deletable)
             except Exception as e:
                 delete_error = str(e)
-            # 无论成功失败都重新拉取核验实际状态
-            latest = {f["fid"]: f for f in await self.bili.get_my_folders(storage=self.storage)}
+            latest = folders
+            confirm_error = ""
+            confirmed = False
+            for delay in (0, 0.5, 1, 2):
+                if delay:
+                    await asyncio.sleep(delay)
+                try:
+                    latest = {f["fid"]: f for f in await self.bili.get_my_folders(storage=self.storage)}
+                    confirmed = True
+                except Exception as exc:
+                    confirm_error = str(exc)
+                    continue
+                if all(fid not in latest for fid in deletable):
+                    break
             for fid in deletable:
-                if fid not in latest:
+                if confirmed and fid not in latest:
                     self.storage.mark_session_source_deleted(sid, fid, True, "")
                     deleted.append(fid)
                 else:
-                    self.storage.mark_session_source_deleted(sid, fid, False, delete_error or "B站返回成功但收藏夹仍存在")
+                    error = delete_error or confirm_error or "B站返回成功但收藏夹仍存在"
+                    self.storage.mark_session_source_deleted(sid, fid, False, error)
                     rejected.append(fid)
         return {"success": len(deleted), "failed": len(rejected), "deleted": deleted, "rejected": rejected}
 
     async def retry_failed(self, sid: str, batch_size: int = 50) -> dict:
+        self._assert_bound_session(sid)
         s = self.storage.load_session(sid)
         if not s or s["status"] != "done":
             raise StateError("仅完成状态可重试失败项")
@@ -918,13 +1315,24 @@ class ClassifySession:
         return {"success": success, "failed": failed}
 
     def list_resumable(self) -> list[dict]:
-        return self.storage.list_sessions_by_status(["pending_review", "executing"])
+        return self.storage.list_sessions_by_status(
+            ["draft", "collecting", "classifying", "failed", "pending_review", "executing"],
+            account_id=self.account_id or None,
+        )
 
     def resume_on_startup(self) -> None:
-        for s in self.storage.list_sessions_by_status(["collecting", "classifying", "executing"]):
-            if s["status"] in ("collecting", "classifying"):
+        for s in self.storage.list_sessions_by_status(
+            ["collecting", "classifying", "executing"],
+            account_id=self.account_id or None,
+        ):
+            if s["status"] == "collecting":
                 self.storage.update_session_status(s["session_id"], "draft")
+            elif s["status"] == "classifying":
+                self.storage.mark_session_failed(
+                    s["session_id"], "classifying", "PROCESS_RESTARTED", "程序重启，等待继续 AI 分类"
+                )
             elif s["status"] == "executing":
+                self.storage.mark_execution_runs_interrupted(s["session_id"])
                 self.storage.update_session_status(s["session_id"], "pending_review")
 
 

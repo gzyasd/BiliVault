@@ -1,5 +1,6 @@
 import json
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -23,6 +24,84 @@ def test_save_and_load_config(tmp_path):
 def test_load_config_returns_none_when_absent(tmp_path):
     storage = Storage(tmp_path)
     assert storage.load_config() is None
+
+
+def test_sessions_can_be_loaded_and_listed_only_for_their_account(tmp_path):
+    storage = Storage(tmp_path)
+    sid_a = storage.create_session(100, "quick")
+    sid_b = storage.create_session(200, "quick")
+    storage.update_session_account(sid_a, "account-a")
+    storage.update_session_account(sid_b, "account-b")
+    storage.update_session_status(sid_a, "pending_review")
+    storage.update_session_status(sid_b, "pending_review")
+
+    assert storage.load_session_for_account(sid_a, "account-a")["session_id"] == sid_a
+    assert storage.load_session_for_account(sid_a, "account-b") is None
+    assert [s["session_id"] for s in storage.list_sessions_by_status(
+        ["pending_review"], account_id="account-a"
+    )] == [sid_a]
+
+
+def test_execution_run_and_target_are_persisted_for_resume(tmp_path):
+    storage = Storage(tmp_path)
+    sid = storage.create_session(100, "quick")
+    storage.update_session_account(sid, "account-a")
+
+    run_id = storage.create_execution_run(
+        sid, version_id="version-1", account_id="account-a", run_id="run-1"
+    )
+    storage.save_execution_target(sid, "version-1", "动画", 9001, status="ready")
+    storage.update_execution_run(run_id, status="interrupted", processed=2, total=3)
+
+    assert storage.get_execution_run(run_id, account_id="account-a")["status"] == "interrupted"
+    assert storage.get_execution_target(sid, "version-1", "动画")["target_fid"] == 9001
+    assert storage.get_latest_execution_run(sid, statuses=["interrupted"])["run_id"] == run_id
+
+
+def test_execution_target_persists_folder_snapshot_for_crash_recovery(tmp_path):
+    storage = Storage(tmp_path)
+    sid = storage.create_session(100, "quick")
+
+    storage.save_execution_target(
+        sid,
+        "version-1",
+        "动画",
+        0,
+        status="creating",
+        baseline_fids=[100, 200],
+    )
+
+    target = storage.get_execution_target(sid, "version-1", "动画")
+    assert json.loads(target["baseline_fids"]) == [100, 200]
+
+
+def test_resource_key_query_supports_thousands_of_items(tmp_path):
+    storage = Storage(tmp_path)
+    for resource_id in range(1, 2001):
+        storage.upsert_video({
+            "account_id": "account-a",
+            "resource_id": resource_id,
+            "resource_type": 2,
+            "avid": resource_id,
+            "bvid": f"BV{resource_id}",
+            "title": f"资源{resource_id}",
+            "intro": "",
+            "tags": "[]",
+            "up_name": "UP",
+            "up_mid": 1,
+            "cover_url": "",
+            "tname": "",
+            "fid": 100,
+        })
+
+    rows = storage.list_videos_by_resource_keys(
+        [(resource_id, 2) for resource_id in range(1, 2001)],
+        account_id="account-a",
+    )
+
+    assert len(rows) == 2000
+    assert rows[0]["resource_id"] == 1
+    assert rows[-1]["resource_id"] == 2000
 
 
 def test_save_and_load_cookie(tmp_path):
@@ -641,6 +720,73 @@ def test_storage_migrates_half_migrated_videos_preserves_resource_type(tmp_path)
         assert row["title"] == "合集半迁移"
 
 
+def test_storage_migrates_resource_key_videos_missing_account_column(tmp_path):
+    db_path = tmp_path / "bibi.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "CREATE TABLE videos (resource_id INTEGER, resource_type INTEGER, avid INTEGER, "
+            "bvid TEXT, title TEXT, intro TEXT, tags TEXT, up_name TEXT, up_mid INTEGER, "
+            "cover_url TEXT, tname TEXT, fid INTEGER, cached_at TEXT, "
+            "PRIMARY KEY (resource_id, resource_type))"
+        )
+        conn.execute(
+            "INSERT INTO videos VALUES (777, 11, 0, '', '无账号半迁移', '', '[]', 'UP', 1, '', '合集', 100, 'now')"
+        )
+
+    storage = Storage(tmp_path)
+
+    rows = storage.list_videos_by_resource_keys([(777, 11)], account_id="")
+    assert [(row["resource_id"], row["resource_type"], row["account_id"]) for row in rows] == [(777, 11, "")]
+
+
+def test_storage_half_migrated_classification_preserves_resource_id(tmp_path):
+    db_path = tmp_path / "bibi.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "CREATE TABLE classifications (session_id TEXT, resource_id INTEGER, avid INTEGER, "
+            "category TEXT, confidence REAL, reason TEXT, adjusted INTEGER DEFAULT 0, "
+            "executed INTEGER DEFAULT 0, PRIMARY KEY (session_id, resource_id))"
+        )
+        conn.execute(
+            "INSERT INTO classifications VALUES ('s1', 999, 111, '半迁移分类', 0.9, '', 0, 0)"
+        )
+
+    storage = Storage(tmp_path)
+
+    row = storage.load_classifications("s1")[0]
+    assert row["resource_id"] == 999
+    assert row["resource_type"] == 2
+
+
+def test_database_backups_never_overwrite_same_second(tmp_path):
+    first = Storage(tmp_path)
+    first._backup_database()
+    second = Storage(tmp_path)
+    second._backup_database()
+
+    backups = list(tmp_path.glob("bibi.db.backup-*"))
+    assert len(backups) == 2
+    assert len({path.name for path in backups}) == 2
+
+
+def test_storage_creates_indexes_for_frequent_session_and_cleanup_queries(tmp_path):
+    storage = Storage(tmp_path)
+    with storage._conn() as conn:
+        indexes = {
+            row["name"]
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'index'")
+        }
+
+    assert {
+        "idx_sessions_account_status",
+        "idx_skipped_items_session",
+        "idx_failed_items_session",
+        "idx_plan_versions_session",
+        "idx_cleanup_scans_account_created",
+        "idx_cleanup_items_scan_state",
+    } <= indexes
+
+
 def test_cleanup_scan_persists_progress_and_isolated_by_account(tmp_path):
     storage = Storage(tmp_path)
     scan_id = storage.create_cleanup_scan("account-a", folders_total=3)
@@ -685,3 +831,132 @@ def test_cleanup_items_use_folder_resource_composite_key(tmp_path):
     updated = storage.list_cleanup_items_by_ids(scan_id, [items[0]["id"]])[0]
     assert updated["removed"] == 1
     assert updated["remove_error"] == ""
+
+
+def test_cleanup_item_count_uses_database_aggregate(tmp_path):
+    storage = Storage(tmp_path)
+    scan_id = storage.create_cleanup_scan("account-a", folders_total=1)
+    storage.add_cleanup_items(scan_id, [
+        {
+            "source_fid": 100,
+            "resource_id": resource_id,
+            "resource_type": 2,
+            "problem_type": "invalid",
+        }
+        for resource_id in range(1, 4)
+    ])
+
+    assert storage.count_cleanup_items(scan_id) == 3
+
+
+def test_large_integer_id_queries_are_chunked_below_sqlite_variable_limit(tmp_path, monkeypatch):
+    storage = Storage(tmp_path)
+    sid = storage.create_session(100, "quick")
+    storage.update_session_account(sid, "account-a")
+    scan_id = storage.create_cleanup_scan("account-a", folders_total=1)
+    ids = list(range(1, 901))
+
+    storage.save_collected_page(
+        sid,
+        "account-a",
+        100,
+        [
+            {
+                "resource_id": item_id,
+                "resource_type": 2,
+                "avid": item_id,
+                "bvid": f"BV{item_id}",
+                "title": f"资源 {item_id}",
+                "intro": "",
+                "tags": "[]",
+                "up_name": "",
+                "up_mid": 0,
+                "cover_url": "",
+                "tname": "",
+                "fid": 100,
+                "account_id": "account-a",
+            }
+            for item_id in ids
+        ],
+        [
+            {
+                "source_fid": 100,
+                "avid": item_id,
+                "resource_type": 2,
+                "reason_code": "invalid",
+                "reason_label": "已失效",
+            }
+            for item_id in ids
+        ],
+    )
+    storage.add_cleanup_items(
+        scan_id,
+        [
+            {
+                "source_fid": 100,
+                "resource_id": item_id,
+                "resource_type": 2,
+                "problem_type": "invalid",
+            }
+            for item_id in ids
+        ],
+    )
+
+    original_conn = storage._conn
+
+    class LimitedConnection:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def execute(self, sql, params=()):
+            if len(params) > 400:
+                raise sqlite3.OperationalError("too many SQL variables")
+            return self._conn.execute(sql, params)
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+    @contextmanager
+    def limited_conn():
+        with original_conn() as conn:
+            yield LimitedConnection(conn)
+
+    monkeypatch.setattr(storage, "_conn", limited_conn)
+
+    assert len(storage.list_videos_by_avids(ids, account_id="account-a")) == 900
+    skipped_ids = [row["id"] for row in storage.list_skipped_items(sid)]
+    assert len(storage.list_skipped_items_by_ids(sid, skipped_ids)) == 900
+    cleanup_ids = [row["id"] for row in storage.list_cleanup_items(scan_id)]
+    assert len(storage.list_cleanup_items_by_ids(scan_id, cleanup_ids)) == 900
+
+
+def test_save_collected_page_is_atomic(tmp_path):
+    storage = Storage(tmp_path)
+    sid = storage.create_session(100, "quick")
+    video = {
+        "resource_id": 1,
+        "resource_type": 2,
+        "avid": 1,
+        "bvid": "BV1",
+        "title": "资源 1",
+        "intro": "",
+        "tags": "[]",
+        "up_name": "",
+        "up_mid": 0,
+        "cover_url": "",
+        "tname": "",
+        "fid": 100,
+        "account_id": "account-a",
+    }
+
+    with pytest.raises(KeyError):
+        storage.save_collected_page(
+            sid,
+            "account-a",
+            100,
+            [video],
+            [{"source_fid": 100, "avid": 1}],
+        )
+
+    assert storage.list_videos_by_resource_keys([(1, 2)], account_id="account-a") == []
+    assert storage.list_session_video_sources(sid) == []

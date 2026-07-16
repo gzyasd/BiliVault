@@ -3,6 +3,7 @@ import pytest
 import respx
 
 from core.bilibili_api import API_BASE, BilibiliClient, _get_mixin_key, _wbi_sign
+from core.errors import BiliApiError
 from core.storage import Storage
 
 
@@ -51,6 +52,19 @@ async def test_client_uses_browser_headers(client):
     async with client._client() as http_client:
         assert "Mozilla" in http_client.headers["user-agent"]
         assert http_client.headers["referer"] == "https://www.bilibili.com/"
+
+
+@pytest.mark.asyncio
+async def test_client_reuses_connection_pool_until_explicitly_closed(client):
+    first = client._client()
+    second = client._client()
+
+    assert first is second
+    assert first.is_closed is False
+
+    await client.aclose()
+    assert first.is_closed is True
+    assert client._client() is not first
 
 
 @respx.mock
@@ -230,6 +244,38 @@ async def test_get_folder_video_pages_continues_when_has_more_with_short_page(cl
     assert route.call_count == 2
     assert pages[0]["has_more"] is True
     assert pages[1]["has_more"] is False
+
+
+@respx.mock
+async def test_resource_pagination_aborts_when_upstream_repeats_same_page(client, monkeypatch):
+    monkeypatch.setattr(client, "cookies", {"SESSDATA": "abc", "DedeUserID": "1", "bili_jct": "x"})
+    respx.get(f"{API_BASE}/x/web-interface/nav").mock(return_value=httpx.Response(200, json={
+        "code": 0,
+        "data": {"wbi_img": {
+            "img_url": "https://x/7cd088941d418c9b7d4932caff0ff715.png",
+            "sub_url": "https://x/e3a47cd088941d418c9b7d4932caff0f.png",
+        }},
+    }))
+    repeated = {
+        "code": 0,
+        "data": {
+            "info": {"media_count": 100},
+            "medias": [{
+                "id": 1, "type": 2, "bvid": "BV1", "title": "A",
+                "upper": {"name": "U"}, "attr": 0,
+            }],
+            "has_more": True,
+        },
+    }
+    route = respx.get(f"{API_BASE}/x/v3/fav/resource/list").mock(
+        return_value=httpx.Response(200, json=repeated)
+    )
+
+    with pytest.raises(BiliApiError, match="分页重复"):
+        async for _ in client.get_folder_resource_pages(100, storage=None, sleep_seconds=0):
+            pass
+
+    assert route.call_count == 2
 
 
 @respx.mock

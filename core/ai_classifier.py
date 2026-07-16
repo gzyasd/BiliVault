@@ -91,6 +91,11 @@ class AiClassifier:
     def _client(self):
         return self._api
 
+    async def aclose(self) -> None:
+        result = self._api.close()
+        if inspect.isawaitable(result):
+            await result
+
     @staticmethod
     def _decode_json_content(content: str) -> dict:
         text = (content or "").strip()
@@ -128,6 +133,9 @@ class AiClassifier:
                 raise AiApiError("AI返回的条目标识或置信度无效", code="AI_BAD_JSON")
             if not resource_id or not isinstance(category, str) or not category.strip():
                 raise AiApiError("AI返回的条目缺少标识或分类", code="AI_BAD_JSON")
+            category = category.strip()
+            if len(category) > 20:
+                raise AiApiError("AI返回的分类名称超过20个字符", code="AI_BAD_JSON")
             if not 0.0 <= confidence <= 1.0:
                 raise AiApiError("AI返回的置信度超出范围", code="AI_BAD_JSON")
             key = (resource_id, resource_type)
@@ -137,7 +145,7 @@ class AiClassifier:
                 **raw,
                 "resource_id": resource_id,
                 "resource_type": resource_type,
-                "category": category.strip(),
+                "category": category,
                 "confidence": confidence,
             }
         return by_key
@@ -345,7 +353,7 @@ class AiClassifier:
         }
         final_categories = {value for value in normalized.values() if value}
         invalid_values = any(
-            not value or value in ("未分类", "其他")
+            not value or len(value) > 20 or value in ("未分类", "其他")
             for value in normalized.values()
         )
         if missing or invalid_values or len(final_categories) > max_categories or len(final_categories) == 0:

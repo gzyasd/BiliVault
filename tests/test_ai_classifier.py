@@ -12,6 +12,19 @@ def make_video(avid, title, up="UP", tname="科技"):
     return VideoInfo(avid=avid, title=title, up_name=up, tname=tname, tags=[])
 
 
+def test_ai_response_rejects_category_names_beyond_bilibili_limit():
+    with pytest.raises(AiApiError, match="分类名称"):
+        AiClassifier._validated_response_items({
+            "items": [{
+                "avid": 1,
+                "resource_type": 2,
+                "category": "超" * 21,
+                "confidence": 0.9,
+                "reason": "",
+            }],
+        })
+
+
 @pytest.mark.asyncio
 async def test_classify_single_batch(monkeypatch):
     classifier = AiClassifier(base_url="http://x", api_key="k", model="m")

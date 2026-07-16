@@ -3,7 +3,9 @@ import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
+from pydantic import ValidationError
 
 import main
 from core.errors import BibiError
@@ -13,9 +15,17 @@ from core.storage import Storage
 class _FakeStorage:
     def __init__(self):
         self.status = "collecting"
+        self.account_id = "account-a"
 
     def load_session(self, sid):
-        return {"session_id": sid, "status": self.status}
+        return {"session_id": sid, "status": self.status, "account_id": self.account_id}
+
+    def load_session_for_account(self, sid, account_id):
+        session = self.load_session(sid)
+        return session if session["account_id"] == account_id else None
+
+    def get_active_account(self):
+        return {"account_id": "account-a"}
 
 
 class _FakeManager:
@@ -38,7 +48,15 @@ class _FakeExecutionStorage:
             "session_id": sid,
             "status": self.status,
             "stats": self.stats,
+            "account_id": "account-a",
         }
+
+    def load_session_for_account(self, sid, account_id):
+        session = self.load_session(sid)
+        return session if account_id == "account-a" else None
+
+    def get_active_account(self):
+        return {"account_id": "account-a"}
 
 
 class _FakeExecutionManager:
@@ -47,7 +65,7 @@ class _FakeExecutionManager:
         self.release = release
         self.calls = 0
 
-    async def execute(self, sid, on_progress=None):
+    async def execute(self, sid, on_progress=None, run_id=None):
         self.calls += 1
         self.storage.status = "executing"
         if on_progress:
@@ -152,7 +170,7 @@ async def test_stream_disconnect_keeps_running_pipeline_registered(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_execute_stream_disconnect_keeps_task_and_reconnect_reuses_it(monkeypatch):
+async def test_execute_stream_does_not_start_missing_job(monkeypatch):
     sid = "sid-execute-stream"
     release = asyncio.Event()
     storage = _FakeExecutionStorage()
@@ -162,29 +180,40 @@ async def test_execute_stream_disconnect_keeps_task_and_reconnect_reuses_it(monk
     main._running_executions.clear()
     main._execution_progress.clear()
 
-    response = await main.api_execute_stream(sid)
+    response = await main.api_execute_stream(sid, job_id="missing-job")
     iterator = response.body_iterator
     first_event = await asyncio.wait_for(anext(iterator), timeout=1)
-    assert "event: stage" in first_event
-    assert '"processed": 1' in first_event
+    assert "event: fail" in first_event
+    assert "EXECUTION_NOT_RUNNING" in first_event
     await iterator.aclose()
+    assert manager.calls == 0
+    assert sid not in main._running_executions
+
+
+@pytest.mark.asyncio
+async def test_execute_post_starts_background_job_and_returns_immediately(monkeypatch):
+    sid = "sid-execute-post"
+    release = asyncio.Event()
+    storage = _FakeExecutionStorage()
+    manager = _FakeExecutionManager(storage, release)
+    monkeypatch.setattr(main, "storage", storage)
+    monkeypatch.setattr(main, "get_session_mgr", lambda: manager)
+    main._running_executions.clear()
+    main._execution_progress.clear()
+    call = asyncio.create_task(main.api_execute(sid))
 
     try:
-        assert sid in main._running_executions
-        assert not main._running_executions[sid].done()
-
-        reconnect = await main.api_execute_stream(sid)
-        reconnect_iterator = reconnect.body_iterator
-        reconnect_event = await asyncio.wait_for(anext(reconnect_iterator), timeout=1)
-        assert "event: stage" in reconnect_event
-        assert '"processed": 1' in reconnect_event
+        await asyncio.sleep(0)
+        assert call.done()
+        response = call.result()
+        data = json.loads(response.body)
+        assert response.status_code == 202
+        assert data["job_id"]
+        assert data["reused"] is False
+        await asyncio.sleep(0)
         assert manager.calls == 1
-
         release.set()
-        done_event = await asyncio.wait_for(anext(reconnect_iterator), timeout=1)
-        assert "event: done" in done_event
-        assert '"success": 2' in done_event
-        await reconnect_iterator.aclose()
+        await asyncio.wait_for(main._running_executions[sid], timeout=1)
     finally:
         release.set()
         task = main._running_executions.get(sid)
@@ -192,6 +221,32 @@ async def test_execute_stream_disconnect_keeps_task_and_reconnect_reuses_it(monk
             await asyncio.wait_for(task, timeout=1)
         main._running_executions.clear()
         main._execution_progress.clear()
+
+
+@pytest.mark.asyncio
+async def test_active_execution_endpoint_returns_running_job(monkeypatch):
+    sid = "sid-active-execution"
+    release = asyncio.Event()
+    storage = _FakeExecutionStorage()
+    manager = _FakeExecutionManager(storage, release)
+    monkeypatch.setattr(main, "storage", storage)
+    monkeypatch.setattr(main, "get_session_mgr", lambda: manager)
+    main._running_executions.clear()
+    main._execution_jobs.clear()
+    main._execution_job_ids.clear()
+    response = await main.api_execute(sid)
+    job_id = json.loads(response.body)["job_id"]
+    await asyncio.sleep(0)
+
+    try:
+        active = await main.api_active_execution(sid)
+        assert active["job_id"] == job_id
+        assert active["running"] is True
+    finally:
+        release.set()
+        task = main._running_executions.get(sid)
+        if task:
+            await task
 
 
 @pytest.mark.asyncio
@@ -246,6 +301,7 @@ async def test_get_bili_returns_active_account_client(monkeypatch, tmp_path):
     assert client is not main.bili
     assert client.account_id == "a1"
     assert client.is_logged_in
+    assert main.get_bili() is client
 
 
 @pytest.mark.asyncio
@@ -412,8 +468,10 @@ async def test_incomplete_config_does_not_block_application_startup(monkeypatch,
         "ai_batch_size": 100,
     })
     get_ai = MagicMock(side_effect=AssertionError("incomplete config must not initialize AI"))
+    manager = MagicMock()
     monkeypatch.setattr(main, "storage", real_storage)
     monkeypatch.setattr(main, "get_ai", get_ai)
+    monkeypatch.setattr(main, "get_session_mgr", MagicMock(return_value=manager))
     monkeypatch.setattr(main.webbrowser, "open", MagicMock())
 
     async with main.lifespan(main.app):
@@ -421,6 +479,82 @@ async def test_incomplete_config_does_not_block_application_startup(monkeypatch,
 
     assert state["configured"] is False
     get_ai.assert_not_called()
+    manager.resume_on_startup.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_lifespan_can_disable_automatic_browser_for_headless_checks(monkeypatch):
+    manager = MagicMock()
+    open_browser = MagicMock()
+    monkeypatch.setattr(main, "get_session_mgr", MagicMock(return_value=manager))
+    monkeypatch.setattr(main.webbrowser, "open", open_browser)
+    monkeypatch.setenv("BIBITOOL_NO_BROWSER", "1")
+
+    async with main.lifespan(main.app):
+        pass
+
+    open_browser.assert_not_called()
+
+
+def test_get_session_manager_does_not_require_ai_for_existing_plan(monkeypatch, tmp_path):
+    real_storage = Storage(tmp_path)
+    sid = real_storage.create_session(100, "quick")
+    real_storage.update_session_account(sid, "account-a")
+    real_storage.update_session_status(sid, "pending_review")
+    client = MagicMock()
+    client.account_id = "account-a"
+    monkeypatch.setattr(main, "storage", real_storage)
+    monkeypatch.setattr(main, "get_bili", lambda: client)
+
+    manager = main.get_session_mgr()
+
+    assert manager.ai is None
+    assert manager.get_plan(sid)["session"]["session_id"] == sid
+
+
+def test_get_ai_reuses_classifier_for_unchanged_configuration(monkeypatch, tmp_path):
+    real_storage = Storage(tmp_path)
+    real_storage.save_config({
+        "ai_base_url": "https://api.example.com",
+        "ai_api_key": "secret",
+        "ai_model": "model",
+        "ai_batch_size": 100,
+    })
+    classifier = MagicMock()
+    factory = MagicMock(return_value=classifier)
+    monkeypatch.setattr(main, "storage", real_storage)
+    monkeypatch.setattr(main, "AiClassifier", factory)
+    monkeypatch.setattr(main, "_ai_classifier", None)
+    monkeypatch.setattr(main, "_ai_signature", None)
+
+    first = main.get_ai()
+    second = main.get_ai()
+
+    assert first is classifier
+    assert second is classifier
+    factory.assert_called_once_with("https://api.example.com", "secret", "model")
+
+
+@pytest.mark.asyncio
+async def test_session_endpoint_rejects_session_owned_by_another_account(monkeypatch, tmp_path):
+    real_storage = Storage(tmp_path)
+    real_storage.upsert_account({
+        "account_id": "account-b", "mid": 2, "uname": "B", "avatar_url": "",
+        "cookie_path": "accounts/b.json", "is_active": 1,
+    })
+    real_storage.activate_account("account-b")
+    sid = real_storage.create_session(100, "quick")
+    real_storage.update_session_account(sid, "account-a")
+    manager = MagicMock()
+    manager.get_plan.return_value = {"session": {"session_id": sid}}
+    monkeypatch.setattr(main, "storage", real_storage)
+    monkeypatch.setattr(main, "get_session_mgr", lambda: manager)
+
+    with pytest.raises(BibiError) as exc_info:
+        await main.api_get_session(sid)
+
+    assert exc_info.value.code == "SESSION_NOT_FOUND"
+    manager.get_plan.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -471,6 +605,57 @@ async def test_refine_stream_reports_progress_and_done(monkeypatch):
     assert "event: stage" in body
     assert '"retry_count": 1' in body
     assert "event: done" in body
+
+
+@pytest.mark.asyncio
+async def test_finished_refinement_job_keeps_only_lightweight_result(monkeypatch):
+    sid = "sid-lightweight-refine"
+    fake_storage = _FakeStorage()
+    fake_storage.status = "pending_review"
+
+    class LargePlanManager:
+        async def refine_plan(self, sid, instruction, on_progress=None):
+            return {
+                "session": {"session_id": sid},
+                "items": [{"resource_id": index} for index in range(5000)],
+                "versions": [{"version_id": "version-2", "is_active": 1}],
+            }
+
+    monkeypatch.setattr(main, "storage", fake_storage)
+    main._running_refinements.clear()
+    main._refinement_jobs.clear()
+
+    job, _ = main._get_or_start_refinement(sid, LargePlanManager(), "refine", "重新整理")
+    result = await job["task"]
+
+    assert result == {"version_id": "version-2"}
+    assert job["result"] == {"version_id": "version-2"}
+    assert "items" not in job["result"]
+
+
+@pytest.mark.asyncio
+async def test_active_refinement_endpoint_returns_running_job(monkeypatch):
+    sid = "sid-active-refine"
+    release = asyncio.Event()
+    fake_storage = _FakeStorage()
+    fake_storage.status = "pending_review"
+    manager = _FakeRefineManager(release)
+    monkeypatch.setattr(main, "storage", fake_storage)
+    monkeypatch.setattr(main, "get_session_mgr", lambda: manager)
+    main._running_refinements.clear()
+    main._refinement_jobs.clear()
+    response = await main.api_refine_plan(sid, main.RefineIn(instruction="继续微调"))
+    job_id = json.loads(response.body)["job_id"]
+    await asyncio.sleep(0)
+
+    try:
+        active = await main.api_active_refinement(sid)
+        assert active["job_id"] == job_id
+        assert active["running"] is True
+        assert active["kind"] == "refine"
+    finally:
+        release.set()
+        await main._refinement_jobs[job_id]["task"]
 
 
 @pytest.mark.asyncio
@@ -546,6 +731,33 @@ async def test_cleanup_scan_api_persists_and_streams_progress(monkeypatch, tmp_p
 
 
 @pytest.mark.asyncio
+async def test_finished_cleanup_scan_job_keeps_only_lightweight_result():
+    class LargeCleanupManager:
+        async def scan(self, scan_id, account_id, on_progress=None):
+            return {
+                "scan": {"scan_id": scan_id, "status": "ready", "problem_total": 5000},
+                "items": [{"id": index} for index in range(5000)],
+            }
+
+    main._cleanup_jobs.clear()
+    job = main._start_cleanup_job(
+        "large-scan",
+        "account-a",
+        LargeCleanupManager(),
+        "scan",
+    )
+
+    result = await job["task"]
+
+    assert result == {
+        "scan_id": "large-scan",
+        "status": "ready",
+        "problem_total": 5000,
+    }
+    assert "items" not in job["result"]
+
+
+@pytest.mark.asyncio
 async def test_cleanup_remove_api_starts_background_removal(monkeypatch, tmp_path):
     real_storage = Storage(tmp_path)
     real_storage.upsert_account({
@@ -599,6 +811,7 @@ async def test_create_session_passes_category_limit(monkeypatch):
     manager = MagicMock()
     manager.create_many = AsyncMock(return_value="sid-limit")
     monkeypatch.setattr(main, "get_session_mgr", lambda: manager)
+    monkeypatch.setattr(main, "_active_account_id", lambda: "account-a")
     payload = main.SessionIn(source_fids=[100, 200], mode="quick", category_limit=8)
 
     result = await main.api_create_session(payload)
@@ -633,6 +846,189 @@ async def test_logout_clears_active_account_cookie_and_state(monkeypatch, tmp_pa
     assert not cookie_abs.exists()
     assert real_storage.get_active_account() is None
     assert main.get_bili().is_logged_in is False
+
+
+@pytest.mark.asyncio
+async def test_switch_account_is_blocked_by_running_refinement(monkeypatch, tmp_path):
+    real_storage = Storage(tmp_path)
+    for account_id in ("account-a", "account-b"):
+        real_storage.upsert_account({
+            "account_id": account_id, "mid": 1 if account_id == "account-a" else 2,
+            "uname": account_id, "avatar_url": "", "cookie_path": f"accounts/{account_id}.json",
+            "is_active": 1 if account_id == "account-a" else 0,
+        })
+    real_storage.activate_account("account-a")
+    sid = real_storage.create_session(100, "quick")
+    real_storage.update_session_account(sid, "account-a")
+    release = asyncio.Event()
+    task = asyncio.create_task(release.wait())
+    monkeypatch.setattr(main, "storage", real_storage)
+    main._running_refinements[sid] = "refine-job"
+    main._refinement_jobs["refine-job"] = {"sid": sid, "task": task}
+
+    try:
+        with pytest.raises(BibiError) as exc_info:
+            await main.api_switch_account("account-b")
+        assert exc_info.value.code == "PIPELINE_RUNNING"
+        assert real_storage.get_active_account()["account_id"] == "account-a"
+    finally:
+        release.set()
+        await task
+        main._running_refinements.clear()
+        main._refinement_jobs.clear()
+
+
+@pytest.mark.asyncio
+async def test_logout_is_blocked_by_running_cleanup_job(monkeypatch, tmp_path):
+    real_storage = Storage(tmp_path)
+    real_storage.upsert_account({
+        "account_id": "account-a", "mid": 1, "uname": "A", "avatar_url": "",
+        "cookie_path": "accounts/a.json", "is_active": 1,
+    })
+    real_storage.activate_account("account-a")
+    release = asyncio.Event()
+    task = asyncio.create_task(release.wait())
+    monkeypatch.setattr(main, "storage", real_storage)
+    main._cleanup_jobs["scan-1"] = {"account_id": "account-a", "task": task}
+
+    try:
+        with pytest.raises(BibiError) as exc_info:
+            await main.api_logout()
+        assert exc_info.value.code == "PIPELINE_RUNNING"
+        assert real_storage.get_active_account()["account_id"] == "account-a"
+    finally:
+        release.set()
+        await task
+        main._cleanup_jobs.clear()
+
+
+@pytest.mark.asyncio
+async def test_finished_job_registries_are_pruned_after_retention(monkeypatch):
+    task = asyncio.create_task(asyncio.sleep(0))
+    await task
+    main._execution_jobs["old-job"] = {
+        "sid": "sid", "task": task, "finished_at": 1.0,
+    }
+
+    main._prune_finished_jobs(now=main.JOB_RETENTION_SECONDS + 2.0)
+
+    assert "old-job" not in main._execution_jobs
+
+
+@pytest.mark.asyncio
+async def test_expired_pending_login_removes_client_temp_cookie_and_closes_http(tmp_path):
+    login_id = "expired-login"
+    cookie_path = tmp_path / "pending.json"
+    cookie_path.write_text("{}", encoding="utf-8")
+    client = MagicMock()
+    client.cookie_store_path = cookie_path
+    client.aclose = AsyncMock()
+    main._pending_logins[login_id] = client
+    main._pending_login_started[login_id] = 1.0
+
+    main._prune_pending_logins(now=main.LOGIN_SESSION_TTL_SECONDS + 2.0)
+    await asyncio.sleep(0)
+
+    assert login_id not in main._pending_logins
+    assert login_id not in main._pending_login_started
+    assert not cookie_path.exists()
+    client.aclose.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_pending_account_login_can_be_cancelled_explicitly(tmp_path):
+    login_id = "cancel-login"
+    cookie_path = tmp_path / "pending.json"
+    cookie_path.write_text("{}", encoding="utf-8")
+    client = MagicMock()
+    client.cookie_store_path = cookie_path
+    client.aclose = AsyncMock()
+    main._pending_logins[login_id] = client
+    main._pending_login_started[login_id] = 1.0
+
+    result = await main.api_cancel_account_login(login_id)
+    await asyncio.sleep(0)
+
+    assert result == {"ok": True, "cancelled": True}
+    assert not cookie_path.exists()
+    client.aclose.assert_awaited_once_with()
+
+
+def test_pending_login_registration_schedules_real_expiry(monkeypatch):
+    client = MagicMock()
+    handle = MagicMock()
+    loop = MagicMock()
+    loop.call_later.return_value = handle
+    monkeypatch.setattr(main.asyncio, "get_running_loop", lambda: loop)
+    main._pending_logins.clear()
+    main._pending_login_started.clear()
+    main._pending_login_expiry_handles.clear()
+
+    main._register_pending_login("login-with-ttl", client)
+
+    assert main._pending_logins["login-with-ttl"] is client
+    loop.call_later.assert_called_once_with(
+        main.LOGIN_SESSION_TTL_SECONDS,
+        main._discard_pending_login,
+        "login-with-ttl",
+    )
+    assert main._pending_login_expiry_handles["login-with-ttl"] is handle
+
+
+@pytest.mark.asyncio
+async def test_runtime_shutdown_cancels_tasks_closes_clients_and_clears_registries(monkeypatch):
+    task = asyncio.create_task(asyncio.Event().wait())
+    default_client = MagicMock()
+    default_client.aclose = AsyncMock()
+    account_client = MagicMock()
+    account_client.aclose = AsyncMock()
+    pending_client = MagicMock()
+    pending_client.cookie_store_path = None
+    pending_client.aclose = AsyncMock()
+    monkeypatch.setattr(main, "bili", default_client)
+    monkeypatch.setattr(main, "_bili_clients", {("a", "x"): account_client})
+    monkeypatch.setattr(main, "_pending_logins", {"login": pending_client})
+    monkeypatch.setattr(main, "_pending_login_started", {"login": 1.0})
+    monkeypatch.setattr(main, "_running_pipelines", {"sid": task})
+    monkeypatch.setattr(main, "_running_executions", {})
+    monkeypatch.setattr(main, "_execution_jobs", {})
+    monkeypatch.setattr(main, "_execution_job_ids", {})
+    monkeypatch.setattr(main, "_execution_progress", {})
+    monkeypatch.setattr(main, "_running_refinements", {})
+    monkeypatch.setattr(main, "_refinement_jobs", {})
+    monkeypatch.setattr(main, "_cleanup_jobs", {})
+
+    await main._shutdown_runtime()
+
+    assert task.cancelled()
+    default_client.aclose.assert_awaited_once_with()
+    account_client.aclose.assert_awaited_once_with()
+    pending_client.aclose.assert_awaited_once_with()
+    assert main._running_pipelines == {}
+    assert main._pending_logins == {}
+
+
+@pytest.mark.asyncio
+async def test_runtime_shutdown_ignores_completed_tasks_from_closed_event_loop(monkeypatch):
+    foreign_loop = asyncio.new_event_loop()
+    foreign_future = foreign_loop.create_future()
+    foreign_future.set_result(None)
+    foreign_loop.close()
+    monkeypatch.setattr(main, "_running_pipelines", {"old-sid": foreign_future})
+    monkeypatch.setattr(main, "_running_executions", {})
+    monkeypatch.setattr(main, "_execution_jobs", {})
+    monkeypatch.setattr(main, "_execution_job_ids", {})
+    monkeypatch.setattr(main, "_execution_progress", {})
+    monkeypatch.setattr(main, "_running_refinements", {})
+    monkeypatch.setattr(main, "_refinement_jobs", {})
+    monkeypatch.setattr(main, "_cleanup_jobs", {})
+    monkeypatch.setattr(main, "_pending_logins", {})
+    monkeypatch.setattr(main, "_pending_login_started", {})
+    monkeypatch.setattr(main, "_bili_clients", {})
+
+    await main._shutdown_runtime()
+
+    assert main._running_pipelines == {}
 
 
 @pytest.mark.asyncio
@@ -677,16 +1073,62 @@ async def test_delete_folder_rejects_non_empty_or_default(monkeypatch, folder, e
 async def test_delete_folder_requires_post_delete_confirmation(monkeypatch):
     client = MagicMock()
     folder = {"fid": 200, "title": "Empty", "media_count": 0, "fav_state": 0}
-    client.get_my_folders = AsyncMock(side_effect=[[folder], [folder]])
+    client.get_my_folders = AsyncMock(side_effect=[[folder]] * 5)
     client.delete_folders = AsyncMock(return_value=True)
     monkeypatch.setattr(main, "get_bili", lambda: client)
     monkeypatch.setattr(main, "_running_pipelines", {})
     monkeypatch.setattr(main, "_running_executions", {})
+    sleep = AsyncMock()
+    monkeypatch.setattr(main.asyncio, "sleep", sleep)
 
     with pytest.raises(BibiError) as exc_info:
         await main.api_delete_folder(200)
 
     assert exc_info.value.code == "FOLDER_DELETE_NOT_CONFIRMED"
+    assert [call.args[0] for call in sleep.await_args_list] == [0.5, 1.0, 2.0]
+
+
+@pytest.mark.asyncio
+async def test_delete_folder_accepts_delayed_remote_confirmation(monkeypatch):
+    client = MagicMock()
+    folder = {"fid": 200, "title": "Empty", "media_count": 0, "fav_state": 0}
+    client.get_my_folders = AsyncMock(side_effect=[[folder], [folder], []])
+    client.delete_folders = AsyncMock(return_value=True)
+    monkeypatch.setattr(main, "get_bili", lambda: client)
+    monkeypatch.setattr(main, "_running_pipelines", {})
+    monkeypatch.setattr(main, "_running_executions", {})
+    sleep = AsyncMock()
+    monkeypatch.setattr(main.asyncio, "sleep", sleep)
+
+    result = await main.api_delete_folder(200)
+
+    assert result == {"ok": True, "fid": 200}
+    sleep.assert_awaited_once_with(0.5)
+
+
+@pytest.mark.asyncio
+async def test_delete_folder_distinguishes_confirmation_transport_failure(monkeypatch):
+    client = MagicMock()
+    folder = {"fid": 200, "title": "Empty", "media_count": 0, "fav_state": 0}
+    client.get_my_folders = AsyncMock(side_effect=[
+        [folder],
+        RuntimeError("network unavailable"),
+        RuntimeError("network unavailable"),
+        RuntimeError("network unavailable"),
+        RuntimeError("network unavailable"),
+    ])
+    client.delete_folders = AsyncMock(return_value=True)
+    monkeypatch.setattr(main, "get_bili", lambda: client)
+    monkeypatch.setattr(main, "_running_pipelines", {})
+    monkeypatch.setattr(main, "_running_executions", {})
+    monkeypatch.setattr(main.asyncio, "sleep", AsyncMock())
+
+    with pytest.raises(BibiError) as exc_info:
+        await main.api_delete_folder(200)
+
+    assert exc_info.value.code == "FOLDER_STATE_CONFIRM_FAILED"
+    assert "操作已经提交" in exc_info.value.user_message
+    client.delete_folders.assert_awaited_once_with([200])
 
 
 @pytest.mark.asyncio
@@ -739,11 +1181,12 @@ async def test_batch_delete_empty_folders_reports_unconfirmed_items(monkeypatch)
         {"fid": 200, "title": "Empty A", "media_count": 0, "fav_state": 0},
         {"fid": 201, "title": "Empty B", "media_count": 0, "fav_state": 0},
     ]
-    client.get_my_folders = AsyncMock(side_effect=[folders, [folders[1]]])
+    client.get_my_folders = AsyncMock(side_effect=[folders] + [[folders[1]]] * 4)
     client.delete_folders = AsyncMock(return_value=True)
     monkeypatch.setattr(main, "get_bili", lambda: client)
     monkeypatch.setattr(main, "_running_pipelines", {})
     monkeypatch.setattr(main, "_running_executions", {})
+    monkeypatch.setattr(main.asyncio, "sleep", AsyncMock())
 
     result = await main.api_batch_delete_folders(main.DeleteFoldersIn(fids=[200, 201]))
 
@@ -797,14 +1240,32 @@ async def test_sort_folders_rejects_incomplete_foreign_or_duplicate_ids(monkeypa
 async def test_sort_folders_requires_remote_confirmation(monkeypatch):
     client = MagicMock()
     original = [{"fid": 100}, {"fid": 200}, {"fid": 300}]
-    client.get_my_folders = AsyncMock(side_effect=[original, original])
+    client.get_my_folders = AsyncMock(side_effect=[original] * 5)
     client.sort_folders = AsyncMock(return_value=True)
     monkeypatch.setattr(main, "get_bili", lambda: client)
+    monkeypatch.setattr(main.asyncio, "sleep", AsyncMock())
 
     with pytest.raises(BibiError) as exc_info:
         await main.api_sort_folders(main.SortFoldersIn(fids=[300, 100, 200]))
 
     assert exc_info.value.code == "FOLDER_SORT_NOT_CONFIRMED"
+
+
+@pytest.mark.asyncio
+async def test_sort_folders_accepts_delayed_remote_confirmation(monkeypatch):
+    client = MagicMock()
+    original = [{"fid": 100}, {"fid": 200}, {"fid": 300}]
+    confirmed = [original[2], original[0], original[1]]
+    client.get_my_folders = AsyncMock(side_effect=[original, original, confirmed])
+    client.sort_folders = AsyncMock(return_value=True)
+    monkeypatch.setattr(main, "get_bili", lambda: client)
+    sleep = AsyncMock()
+    monkeypatch.setattr(main.asyncio, "sleep", sleep)
+
+    result = await main.api_sort_folders(main.SortFoldersIn(fids=[300, 100, 200]))
+
+    assert result == {"ok": True, "fids": [300, 100, 200]}
+    sleep.assert_awaited_once_with(0.5)
 
 
 @pytest.mark.asyncio
@@ -834,3 +1295,92 @@ async def test_folder_resources_returns_ids_on_first_page_only(monkeypatch):
     assert second["resource_ids"] == []
     client.get_folder_resource_ids.assert_awaited_once_with(200, storage=main.storage)
     assert client.get_folder_resource_page.await_args_list[1].kwargs["page"] == 2
+
+
+def test_server_binds_to_loopback_by_default(monkeypatch):
+    monkeypatch.delenv("BIBITOOL_HOST", raising=False)
+    monkeypatch.delenv("BIBITOOL_LAN_TOKEN", raising=False)
+    monkeypatch.delenv("BIBITOOL_ALLOWED_HOSTS", raising=False)
+
+    settings = main._resolve_bind_settings()
+
+    assert settings.host == "127.0.0.1"
+    assert settings.lan_auth_enabled is False
+
+
+def test_api_input_models_validate_modes_ids_and_trim_text():
+    with pytest.raises(ValidationError):
+        main.SessionIn(source_fids=[100], mode="unexpected")
+    with pytest.raises(ValidationError):
+        main.SessionIn(source_fids=[0], mode="quick")
+    with pytest.raises(ValidationError):
+        main.RefineIn(instruction="   ")
+    with pytest.raises(ValidationError):
+        main.RemoveCleanupIn(item_ids=list(range(1, 5002)))
+
+    session = main.SessionIn(source_fids=[100, 100, 200], mode="full")
+    adjust = main.AdjustIn(resource_id=1, resource_type=2, new_category="  科技数码  ")
+    assert session.normalized_source_fids() == [100, 200]
+    assert adjust.new_category == "科技数码"
+
+
+def test_default_privacy_is_not_exposed_as_an_ineffective_config_option():
+    config = main.ConfigIn(ai_base_url="http://x", ai_api_key="k", ai_model="m")
+    assert "default_privacy" not in config.model_dump()
+
+
+def test_non_loopback_bind_requires_token_and_allowed_hosts(monkeypatch):
+    monkeypatch.setenv("BIBITOOL_HOST", "0.0.0.0")
+    monkeypatch.delenv("BIBITOOL_LAN_TOKEN", raising=False)
+    monkeypatch.delenv("BIBITOOL_ALLOWED_HOSTS", raising=False)
+
+    with pytest.raises(RuntimeError, match="BIBITOOL_LAN_TOKEN"):
+        main._resolve_bind_settings()
+
+    monkeypatch.setenv("BIBITOOL_LAN_TOKEN", "0123456789abcdef")
+    with pytest.raises(RuntimeError, match="BIBITOOL_ALLOWED_HOSTS"):
+        main._resolve_bind_settings()
+
+
+@pytest.mark.asyncio
+async def test_lan_mode_requires_pairing_cookie_and_rejects_cross_origin_writes(monkeypatch):
+    monkeypatch.setenv("BIBITOOL_HOST", "0.0.0.0")
+    monkeypatch.setenv("BIBITOOL_LAN_TOKEN", "0123456789abcdef")
+    monkeypatch.setenv("BIBITOOL_ALLOWED_HOSTS", "lan.example")
+    transport = httpx.ASGITransport(app=main.app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://lan.example") as client:
+        unauthorized = await client.get("/api/runtime")
+        assert unauthorized.status_code == 401
+
+        paired = await client.get("/?access_token=0123456789abcdef")
+        assert paired.status_code == 303
+        assert client.cookies.get("bibitool_access") == "0123456789abcdef"
+
+        runtime = await client.get("/api/runtime")
+        assert runtime.status_code == 200
+
+        cross_origin = await client.post(
+            "/api/logout",
+            headers={"Origin": "http://attacker.example"},
+        )
+        assert cross_origin.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_local_mode_rejects_untrusted_host_and_cross_origin_writes(monkeypatch):
+    monkeypatch.delenv("BIBITOOL_HOST", raising=False)
+    monkeypatch.delenv("BIBITOOL_LAN_TOKEN", raising=False)
+    monkeypatch.delenv("BIBITOOL_ALLOWED_HOSTS", raising=False)
+    transport = httpx.ASGITransport(app=main.app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://attacker.example") as client:
+        invalid_host = await client.get("/api/runtime")
+        assert invalid_host.status_code == 400
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://localhost") as client:
+        cross_origin = await client.post(
+            "/api/logout",
+            headers={"Origin": "http://attacker.example"},
+        )
+        assert cross_origin.status_code == 403

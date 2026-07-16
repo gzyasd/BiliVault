@@ -7,7 +7,7 @@ from core.session import ClassifySession
 from core.bilibili_api import BilibiliClient
 from core.ai_classifier import AiClassifier, VideoInfo, Classification
 from core.storage import Storage
-from core.errors import BiliApiError, StateError
+from core.errors import BiliApiError, BibiError, StateError
 
 
 @pytest.fixture
@@ -62,6 +62,40 @@ async def test_session_full_flow_with_progress(deps):
     assert "collecting" in stages
     assert "classifying" in stages
     assert "pending_review" in stages
+
+
+def test_resumable_sessions_are_filtered_by_bound_bilibili_account(deps):
+    storage, bili, ai = deps
+    sid_a = storage.create_session(100, "quick")
+    sid_b = storage.create_session(200, "quick")
+    storage.update_session_account(sid_a, "account-a")
+    storage.update_session_account(sid_b, "account-b")
+    storage.update_session_status(sid_a, "pending_review")
+    storage.update_session_status(sid_b, "pending_review")
+    bili.account_id = "account-a"
+
+    resumable = ClassifySession(storage, bili, ai).list_resumable()
+
+    assert [item["session_id"] for item in resumable] == [sid_a]
+
+
+@pytest.mark.asyncio
+async def test_manager_rechecks_bound_account_before_destructive_execution(deps):
+    storage, bili, ai = deps
+    sid = storage.create_session(100, "quick")
+    storage.update_session_account(sid, "account-a")
+    storage.update_session_status(sid, "pending_review")
+    storage.save_classifications(sid, [
+        {"avid": 1, "category": "动画", "confidence": 0.9, "reason": ""},
+    ])
+    bili.account_id = "account-b"
+    bili.create_folder = AsyncMock()
+    manager = ClassifySession(storage, bili, ai)
+
+    with pytest.raises(StateError, match="账号"):
+        await manager.execute(sid)
+
+    bili.create_folder.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -138,6 +172,61 @@ async def test_session_full_mode_enriches_video_before_classification(deps):
 
 
 @pytest.mark.asyncio
+async def test_full_mode_enrichment_is_deduplicated_and_bounded_concurrent(deps):
+    storage, bili, ai = deps
+    entries = [
+        {
+            "avid": idx,
+            "bvid": "BV-DUP" if idx in (1, 2) else f"BV{idx}",
+            "title": f"视频 {idx}",
+            "intro": "",
+            "tags": "[]",
+            "up_name": "UP",
+            "up_mid": 11,
+            "cover_url": "",
+            "tname": "科技",
+            "fid": 100,
+        }
+        for idx in range(1, 10)
+    ]
+
+    async def fake_pages(fid, storage=None, page_size=20, sleep_seconds=0):
+        yield {
+            "page": 1,
+            "videos": entries,
+            "raw_count": len(entries),
+            "usable_count": len(entries),
+            "skipped_count": 0,
+            "skipped_reasons": {},
+            "expected_total": len(entries),
+            "has_more": False,
+        }
+
+    active = 0
+    peak = 0
+    calls: list[str] = []
+
+    async def fake_info(bvid):
+        nonlocal active, peak
+        calls.append(bvid)
+        active += 1
+        peak = max(peak, active)
+        await asyncio.sleep(0.01)
+        active -= 1
+        return {"intro": f"详情 {bvid}", "tags": ["标签"]}
+
+    bili.get_folder_video_pages = fake_pages
+    bili.get_video_info = fake_info
+    session = ClassifySession(storage, bili, ai)
+    sid = await session.create(source_fid=100, mode="full")
+
+    await session.collect(sid)
+
+    assert calls.count("BV-DUP") == 1
+    assert 2 <= peak <= 5
+
+
+@pytest.mark.asyncio
 async def test_session_resume_pending(deps):
     storage, bili, ai = deps
     sid = storage.create_session(source_fid=100, mode="quick")
@@ -159,6 +248,19 @@ async def test_create_many_persists_category_limit(deps):
     sid = await session.create_many([100], "quick", category_limit=8)
 
     assert storage.load_session(sid)["category_limit"] == 8
+
+
+@pytest.mark.asyncio
+async def test_create_many_does_not_leave_draft_when_source_validation_fails(deps):
+    storage, bili, ai = deps
+    bili.get_my_folders = AsyncMock(return_value=[])
+    session = ClassifySession(storage, bili, ai)
+
+    with pytest.raises(BibiError) as exc_info:
+        await session.create_many([999], "quick")
+
+    assert exc_info.value.code == "SOURCE_FOLDER_NOT_FOUND"
+    assert storage.list_sessions_by_status(["draft"]) == []
 
 
 @pytest.mark.asyncio
@@ -709,6 +811,190 @@ async def test_execute_groups_moves_by_source_folder(deps):
 
 
 @pytest.mark.asyncio
+async def test_execute_resume_reuses_target_and_skips_already_moved_source(deps):
+    storage, bili, ai = deps
+    sid = storage.create_session(source_fid=100, mode="quick")
+    storage.update_session_status(sid, "pending_review")
+    storage.add_session_video_source(sid, resource_id=1, source_fid=100, resource_type=2)
+    storage.add_session_video_source(sid, resource_id=2, source_fid=100, resource_type=2)
+    storage.mark_session_video_source_moved(sid, 1, 100, True, resource_type=2)
+    version_id = storage.create_plan_version(sid, None, "初始", [
+        {"avid": 1, "category": "动漫", "confidence": 0.9, "reason": "", "executed": 1},
+        {"avid": 2, "category": "动漫", "confidence": 0.9, "reason": ""},
+    ], activate=True)
+    storage.save_execution_target(sid, version_id, "动漫", 9001, status="ready")
+    bili.create_folder = AsyncMock(return_value=9999)
+    bili.move_resources = AsyncMock(return_value=True)
+
+    stats = await ClassifySession(storage, bili, ai).execute(sid, run_id="resume-run")
+
+    assert stats == {"success": 1, "failed": 0, "total": 1}
+    bili.create_folder.assert_not_awaited()
+    bili.move_resources.assert_awaited_once_with(
+        src_media_id=100, tar_media_id=9001, resources="2:2"
+    )
+    assert storage.get_execution_run("resume-run")["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_execute_reconciles_remote_move_completed_before_local_commit(deps):
+    storage, bili, ai = deps
+    sid = storage.create_session(source_fid=100, mode="quick")
+    storage.update_session_status(sid, "pending_review")
+    storage.add_session_video_source(sid, resource_id=1, source_fid=100, resource_type=2)
+    version_id = storage.create_plan_version(sid, None, "初始", [
+        {"avid": 1, "category": "动漫", "confidence": 0.9, "reason": ""},
+    ], activate=True)
+    storage.save_execution_target(sid, version_id, "动漫", 9001, status="ready")
+
+    async def remote_ids(fid, storage=None):
+        if fid == 9001:
+            return [{"resource_id": 1, "resource_type": 2}]
+        return []
+
+    bili.get_folder_resource_ids = remote_ids
+    bili.get_my_folders = AsyncMock(return_value=[])
+    bili.create_folder = AsyncMock()
+    bili.move_resources = AsyncMock()
+
+    stats = await ClassifySession(storage, bili, ai).execute(sid, run_id="reconcile-run")
+
+    assert stats == {"success": 1, "failed": 0, "total": 1}
+    bili.create_folder.assert_not_awaited()
+    bili.move_resources.assert_not_awaited()
+    assert storage.list_session_video_sources(sid)[0]["moved"] == 1
+    assert storage.load_plan_items(version_id)[0]["executed"] == 1
+
+
+@pytest.mark.asyncio
+async def test_execute_recovers_folder_created_before_target_id_commit(deps):
+    storage, bili, ai = deps
+    sid = storage.create_session(source_fid=100, mode="quick")
+    storage.update_session_status(sid, "pending_review")
+    storage.add_session_video_source(sid, resource_id=1, source_fid=100, resource_type=2)
+    version_id = storage.create_plan_version(sid, None, "初始", [
+        {"avid": 1, "category": "动漫", "confidence": 0.9, "reason": ""},
+    ], activate=True)
+    storage.save_execution_target(
+        sid,
+        version_id,
+        "动漫",
+        0,
+        status="creating",
+        baseline_fids=[100, 200],
+    )
+    bili.get_my_folders = AsyncMock(return_value=[
+        {"fid": 100, "title": "默认收藏夹", "media_count": 1},
+        {"fid": 200, "title": "旧收藏夹", "media_count": 0},
+        {"fid": 9001, "title": "动漫", "media_count": 0},
+    ])
+
+    async def remote_ids(fid, storage=None):
+        return [{"resource_id": 1, "resource_type": 2}] if fid == 100 else []
+
+    bili.get_folder_resource_ids = remote_ids
+    bili.create_folder = AsyncMock()
+    bili.move_resources = AsyncMock(return_value=True)
+
+    stats = await ClassifySession(storage, bili, ai).execute(sid, run_id="folder-recovery-run")
+
+    assert stats == {"success": 1, "failed": 0, "total": 1}
+    bili.create_folder.assert_not_awaited()
+    bili.move_resources.assert_awaited_once_with(
+        src_media_id=100,
+        tar_media_id=9001,
+        resources="1:2",
+    )
+    assert storage.get_execution_target(sid, version_id, "动漫")["target_fid"] == 9001
+
+
+@pytest.mark.asyncio
+async def test_recollect_replaces_previous_resources_and_skipped_items(deps):
+    storage, bili, ai = deps
+    run = 0
+
+    async def pages(fid, storage=None):
+        resource_id = 1 if run == 0 else 3
+        yield {
+            "page": 1,
+            "videos": [],
+            "resources": [{
+                "resource_id": resource_id, "resource_type": 2, "avid": resource_id,
+                "bvid": f"BV{resource_id}", "title": f"资源{resource_id}", "intro": "",
+                "tags": "[]", "up_name": "UP", "up_mid": 1, "cover_url": "",
+                "tname": "", "fid": fid,
+            }],
+            "raw_count": 2, "usable_count": 1, "skipped_count": 1,
+            "skipped_reasons": {"attr_invalid": 1},
+            "skipped_items": [{
+                "source_fid": fid, "avid": 2, "bvid": "BV2", "title": "失效资源",
+                "resource_type": 2, "raw_attr": 1, "reason_code": "attr_invalid",
+                "reason_label": "已失效", "detail": "", "removable": True,
+            }],
+            "expected_total": 2, "has_more": False,
+        }
+
+    async def resource_ids(fid, storage=None):
+        resource_id = 1 if run == 0 else 3
+        return [
+            {"resource_id": resource_id, "resource_type": 2},
+            {"resource_id": 2, "resource_type": 2},
+        ]
+
+    bili.get_folder_resource_pages = pages
+    bili.get_folder_resource_ids = resource_ids
+    session = ClassifySession(storage, bili, ai)
+    sid = await session.create(100, "quick")
+    await session.collect(sid)
+    run = 1
+    storage.update_session_status(sid, "draft")
+
+    await session.collect(sid)
+
+    assert [row["resource_id"] for row in storage.list_session_video_sources(sid)] == [3]
+    assert len(storage.list_skipped_items(sid)) == 1
+
+
+@pytest.mark.asyncio
+async def test_classification_failure_is_persisted_and_retries_without_recollecting(deps):
+    storage, bili, ai = deps
+    page_calls = 0
+
+    async def pages(fid, storage=None):
+        nonlocal page_calls
+        page_calls += 1
+        yield {
+            "page": 1,
+            "videos": [{
+                "avid": 1, "bvid": "BV1", "title": "资源1", "intro": "", "tags": "[]",
+                "up_name": "UP", "up_mid": 1, "cover_url": "", "tname": "", "fid": fid,
+            }],
+            "raw_count": 1, "usable_count": 1, "skipped_count": 0,
+            "skipped_reasons": {}, "skipped_items": [], "expected_total": 1, "has_more": False,
+        }
+
+    bili.get_folder_video_pages = pages
+    ai.classify = AsyncMock(side_effect=[RuntimeError("AI temporary failure"), [
+        Classification(1, "教程", 0.9, "")
+    ]])
+    session = ClassifySession(storage, bili, ai)
+    sid = await session.create(100, "quick")
+
+    with pytest.raises(RuntimeError, match="AI temporary failure"):
+        await session.run_pipeline(sid)
+
+    failed = storage.load_session(sid)
+    assert failed["status"] == "failed"
+    assert failed["failed_stage"] == "classifying"
+    assert "AI temporary failure" in failed["error_message"]
+
+    await session.run_pipeline(sid)
+
+    assert storage.load_session(sid)["status"] == "pending_review"
+    assert page_calls == 1
+
+
+@pytest.mark.asyncio
 async def test_retry_failed_retries_by_original_source_folder(deps):
     """多源失败重试应按原始来源收藏夹分组重试，统计来源实例数。"""
     storage, bili, ai = deps
@@ -815,6 +1101,47 @@ async def test_delete_empty_source_folders_rechecks_after_exception(deps):
     assert 200 in stats["deleted"]
     assert stats["success"] == 1
     assert call_count["n"] == 2
+
+
+@pytest.mark.asyncio
+async def test_delete_empty_source_folders_waits_for_remote_consistency(deps, monkeypatch):
+    storage, bili, ai = deps
+    sid = storage.create_session(source_fid=100, mode="quick")
+    storage.update_session_status(sid, "done")
+    storage.save_session_sources(sid, [
+        {"source_fid": 200, "title": "空夹", "media_count": 0, "selected_order": 0, "delete_protected": 0},
+    ])
+    responses = [
+        [{"fid": 200, "title": "空夹", "media_count": 0, "cover_url": "", "fav_state": 0}],
+        [{"fid": 200, "title": "空夹", "media_count": 0, "cover_url": "", "fav_state": 0}],
+        [],
+    ]
+    bili.get_my_folders = AsyncMock(side_effect=responses)
+    bili.delete_folders = AsyncMock(return_value=True)
+    sleeps = []
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    stats = await ClassifySession(storage, bili, ai).delete_empty_source_folders(sid, [200])
+
+    assert stats["deleted"] == [200]
+    assert sleeps == [0.5]
+
+
+def test_resume_on_startup_makes_interrupted_execution_retryable(deps):
+    storage, bili, ai = deps
+    sid = storage.create_session(source_fid=100, mode="quick")
+    storage.update_session_status(sid, "executing")
+    run_id = storage.create_execution_run(sid, version_id=None, account_id="")
+    storage.update_execution_run(run_id, status="running")
+
+    ClassifySession(storage, bili, ai).resume_on_startup()
+
+    assert storage.load_session(sid)["status"] == "pending_review"
+    assert storage.get_execution_run(run_id)["status"] == "interrupted"
 
 
 @pytest.mark.asyncio

@@ -63,16 +63,72 @@ def _extract_key(url: str) -> str:
     return url.rsplit("/", 1)[-1].split(".")[0]
 
 
+def _guard_page_progress(fid: int, page: int, medias: list[dict], seen: set[tuple]) -> None:
+    page_keys = set()
+    for media in medias:
+        resource_id = media.get("id")
+        resource_type = media.get("type", 2)
+        fallback = media.get("bvid") or media.get("title") or json.dumps(
+            media,
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        )
+        page_keys.add((resource_id, resource_type, fallback if not resource_id else ""))
+    if medias and page_keys and not (page_keys - seen):
+        raise BiliApiError(-1, f"收藏夹 {fid} 第 {page} 页分页重复，未发现新增资源")
+    seen.update(page_keys)
+
+
+def _guard_page_limit(fid: int, next_page: int, expected_total, page_size: int) -> None:
+    if expected_total is not None:
+        declared_pages = max(1, (int(expected_total) + page_size - 1) // page_size)
+        if next_page > declared_pages + 5:
+            raise BiliApiError(-1, f"收藏夹 {fid} 分页超过声明总数，已停止继续请求")
+    elif next_page > 5000:
+        raise BiliApiError(-1, f"收藏夹 {fid} 分页超过安全上限，已停止继续请求")
+
+
 class BilibiliClient:
     def __init__(self, cookie_store_path: Path | str | None = None, account_id: str = ""):
         self.cookie_store_path = Path(cookie_store_path) if cookie_store_path else None
         self.account_id = account_id
         self.cookies: dict[str, str] = {}
+        self._http_client: httpx.AsyncClient | None = None
+        self._request_semaphore = asyncio.Semaphore(6)
         if self.cookie_store_path and self.cookie_store_path.exists():
             self.cookies = json.loads(self.cookie_store_path.read_text(encoding="utf-8"))
 
     def _client(self) -> httpx.AsyncClient:
-        return httpx.AsyncClient(cookies=self.cookies, headers=_DEFAULT_HEADERS, timeout=15.0)
+        if self._http_client is None or self._http_client.is_closed:
+            self._http_client = httpx.AsyncClient(
+                cookies=self.cookies,
+                headers=_DEFAULT_HEADERS,
+                timeout=httpx.Timeout(15.0, connect=10.0),
+                limits=httpx.Limits(max_connections=8, max_keepalive_connections=6),
+            )
+        return self._http_client
+
+    async def aclose(self) -> None:
+        if self._http_client is not None and not self._http_client.is_closed:
+            await self._http_client.aclose()
+
+    async def _request(self, method: str, url: str, **kwargs) -> httpx.Response:
+        last_error: Exception | None = None
+        for attempt in range(3):
+            try:
+                async with self._request_semaphore:
+                    response = await self._client().request(method, url, **kwargs)
+                if response.status_code == 429 or response.status_code >= 500:
+                    response.raise_for_status()
+                return response
+            except (httpx.TransportError, httpx.HTTPStatusError) as exc:
+                last_error = exc
+                if attempt == 2:
+                    raise
+                await asyncio.sleep(0.25 * (2 ** attempt))
+        assert last_error is not None
+        raise last_error
 
     def save_cookies(self) -> None:
         if self.cookie_store_path:
@@ -82,6 +138,8 @@ class BilibiliClient:
 
     def clear_cookies(self) -> None:
         self.cookies = {}
+        if self._http_client is not None:
+            self._http_client.cookies.clear()
         if self.cookie_store_path and self.cookie_store_path.exists():
             self.cookie_store_path.unlink()
 
@@ -99,20 +157,23 @@ class BilibiliClient:
         return self.cookies.get("bili_jct")
 
     async def qrcode_generate(self) -> dict:
-        async with self._client() as c:
-            r = await c.get(f"{PASSPORT_BASE}/x/passport-login/web/qrcode/generate", params={"returnType": 0})
-            data = r.json()
+        r = await self._request(
+            "GET",
+            f"{PASSPORT_BASE}/x/passport-login/web/qrcode/generate",
+            params={"returnType": 0},
+        )
+        data = r.json()
         if data["code"] != 0:
             raise BiliApiError(data["code"], data.get("message", "生成二维码失败"))
         return data["data"]
 
     async def qrcode_poll(self, qrcode_key: str) -> dict:
-        async with self._client() as c:
-            r = await c.get(
-                f"{PASSPORT_BASE}/x/passport-login/web/qrcode/poll",
-                params={"qrcode_key": qrcode_key},
-            )
-            data = r.json()
+        r = await self._request(
+            "GET",
+            f"{PASSPORT_BASE}/x/passport-login/web/qrcode/poll",
+            params={"qrcode_key": qrcode_key},
+        )
+        data = r.json()
         payload = data.get("data") or {}
         code = payload.get("code", data.get("code"))
         if code == 0:
@@ -120,6 +181,7 @@ class BilibiliClient:
                 parts = cookie.split(";")[0].split("=", 1)
                 if len(parts) == 2:
                     self.cookies[parts[0]] = parts[1]
+                    self._client().cookies.set(parts[0], parts[1])
             self.save_cookies()
             return {"status": "success", "mid": payload.get("mid")}
         if code == 86101:
@@ -147,9 +209,8 @@ class BilibiliClient:
             cached = storage.load_wbi_keys(account_id=self.account_id)
             if cached:
                 return cached
-        async with self._client() as c:
-            r = await c.get(f"{API_BASE}/x/web-interface/nav")
-            data = r.json()
+        r = await self._request("GET", f"{API_BASE}/x/web-interface/nav")
+        data = r.json()
         self._check_bili_response(data)
         img_url = data["data"]["wbi_img"]["img_url"]
         sub_url = data["data"]["wbi_img"]["sub_url"]
@@ -169,9 +230,8 @@ class BilibiliClient:
 
     async def _wbi_get_once(self, path: str, params: dict, keys: dict) -> dict:
         signed = _wbi_sign(params, keys["img_key"], keys["sub_key"])
-        async with self._client() as c:
-            r = await c.get(f"{API_BASE}{path}", params=signed)
-            return r.json()
+        r = await self._request("GET", f"{API_BASE}{path}", params=signed)
+        return r.json()
 
     async def get_my_folders(self, storage=None) -> list[dict]:
         self._require_login()
@@ -196,9 +256,8 @@ class BilibiliClient:
     async def get_my_profile(self) -> dict:
         """获取当前登录账号资料（mid、uname、face）。"""
         self._require_login()
-        async with self._client() as c:
-            r = await c.get(f"{API_BASE}/x/web-interface/nav")
-            data = r.json()
+        r = await self._request("GET", f"{API_BASE}/x/web-interface/nav")
+        data = r.json()
         self._check_bili_response(data)
         info = data.get("data", {})
         return {
@@ -224,6 +283,7 @@ class BilibiliClient:
         pn = 1
         scanned = 0
         expected_total = None
+        seen_page_resources: set[tuple] = set()
         while True:
             data = await self._wbi_get(
                 "/x/v3/fav/resource/list",
@@ -231,6 +291,7 @@ class BilibiliClient:
                 storage,
             )
             medias = data.get("medias") or []
+            _guard_page_progress(fid, pn, medias, seen_page_resources)
             info = data.get("info") or {}
             if expected_total is None:
                 expected_total = info.get("media_count")
@@ -300,6 +361,7 @@ class BilibiliClient:
             if has_more is None and len(medias) < page_size:
                 return
             pn += 1
+            _guard_page_limit(fid, pn, expected_total, page_size)
             if sleep_seconds:
                 await asyncio.sleep(sleep_seconds)
 
@@ -314,6 +376,7 @@ class BilibiliClient:
         pn = 1
         scanned = 0
         expected_total = None
+        seen_page_resources: set[tuple] = set()
         while True:
             data = await self._wbi_get(
                 "/x/v3/fav/resource/list",
@@ -321,6 +384,7 @@ class BilibiliClient:
                 storage,
             )
             medias = data.get("medias") or []
+            _guard_page_progress(fid, pn, medias, seen_page_resources)
             info = data.get("info") or {}
             if expected_total is None:
                 expected_total = info.get("media_count")
@@ -402,6 +466,7 @@ class BilibiliClient:
             if has_more is None and len(medias) < page_size:
                 return
             pn += 1
+            _guard_page_limit(fid, pn, expected_total, page_size)
             if sleep_seconds:
                 await asyncio.sleep(sleep_seconds)
 
@@ -474,11 +539,10 @@ class BilibiliClient:
 
     async def get_video_info(self, bvid: str) -> dict:
         self._require_login()
-        async with self._client() as c:
-            view_resp = await c.get(f"{API_BASE}/x/web-interface/view", params={"bvid": bvid})
-            view_data = self._check_bili_response(view_resp.json())
-            tag_resp = await c.get(f"{API_BASE}/x/tag/archive/tags", params={"bvid": bvid})
-            tag_data = self._check_bili_response(tag_resp.json())
+        view_resp = await self._request("GET", f"{API_BASE}/x/web-interface/view", params={"bvid": bvid})
+        view_data = self._check_bili_response(view_resp.json())
+        tag_resp = await self._request("GET", f"{API_BASE}/x/tag/archive/tags", params={"bvid": bvid})
+        tag_data = self._check_bili_response(tag_resp.json())
         return {
             "avid": view_data.get("aid", 0),
             "bvid": view_data.get("bvid", bvid),
@@ -494,9 +558,8 @@ class BilibiliClient:
     async def _post_form(self, path: str, form: dict) -> dict:
         self._require_login()
         form = {**form, "csrf": self.csrf}
-        async with self._client() as c:
-            r = await c.post(f"{API_BASE}{path}", data=form)
-            data = r.json()
+        r = await self._request("POST", f"{API_BASE}{path}", data=form)
+        data = r.json()
         return self._check_bili_response(data)
 
     async def create_folder(self, title: str, privacy: int = 1, intro: str = "") -> int:

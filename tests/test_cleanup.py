@@ -125,3 +125,136 @@ async def test_cancelled_scan_is_persisted_as_cancelled(tmp_path):
         await task
 
     assert storage.get_cleanup_scan(scan_id, "account-a")["status"] == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_scan_aborts_repeated_non_progressing_detail_page(tmp_path):
+    storage = Storage(tmp_path)
+    bili = MagicMock()
+    bili.get_my_folders = AsyncMock(return_value=[
+        {"fid": 100, "title": "默认收藏夹", "media_count": 100, "fav_state": 1},
+    ])
+    bili.get_folder_resource_page = AsyncMock(return_value={
+        "page": 1,
+        "total": 100,
+        "has_more": True,
+        "items": [{"resource_id": 1, "resource_type": 2, "status": "available"}],
+    })
+    bili.get_folder_resource_ids = AsyncMock()
+    scan_id = storage.create_cleanup_scan("account-a", 0)
+
+    with pytest.raises(Exception, match="分页重复"):
+        await CleanupManager(storage, bili, sleep=AsyncMock()).scan(scan_id, "account-a")
+
+    assert bili.get_folder_resource_page.await_count == 2
+    assert storage.get_cleanup_scan(scan_id, "account-a")["status"] == "failed"
+    bili.get_folder_resource_ids.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_scan_aborts_unique_pages_when_upstream_omits_total_forever(tmp_path, monkeypatch):
+    storage = Storage(tmp_path)
+    bili = MagicMock()
+    bili.get_my_folders = AsyncMock(return_value=[
+        {"fid": 100, "title": "默认收藏夹", "media_count": 0, "fav_state": 1},
+    ])
+
+    async def resource_page(fid, page=1, page_size=20, storage=None):
+        return {
+            "page": page,
+            "total": 0,
+            "has_more": True,
+            "items": [{"resource_id": page, "resource_type": 2, "status": "available"}],
+        }
+
+    bili.get_folder_resource_page = AsyncMock(side_effect=resource_page)
+    bili.get_folder_resource_ids = AsyncMock()
+    monkeypatch.setattr("core.cleanup.MAX_CLEANUP_PAGES_WITHOUT_TOTAL", 2)
+    scan_id = storage.create_cleanup_scan("account-a", 0)
+
+    with pytest.raises(Exception, match="安全上限"):
+        await CleanupManager(storage, bili, sleep=AsyncMock()).scan(scan_id, "account-a")
+
+    assert bili.get_folder_resource_page.await_count == 2
+    assert storage.get_cleanup_scan(scan_id, "account-a")["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_remove_verification_failure_persists_failed_state_and_item_error(tmp_path):
+    storage = Storage(tmp_path)
+    bili = MagicMock()
+    bili.batch_delete_resources = AsyncMock(return_value=True)
+    bili.get_folder_resource_ids = AsyncMock(side_effect=RuntimeError("verify failed"))
+    scan_id = storage.create_cleanup_scan("account-a", 1)
+    storage.update_cleanup_scan(scan_id, status="ready")
+    storage.add_cleanup_items(scan_id, [{
+        "source_fid": 100, "source_title": "默认收藏夹", "resource_id": 1,
+        "resource_type": 2, "problem_type": "invalid", "problem_label": "已失效",
+    }])
+    item = storage.list_cleanup_items(scan_id)[0]
+
+    with pytest.raises(RuntimeError, match="verify failed"):
+        await CleanupManager(storage, bili, sleep=AsyncMock()).remove(
+            scan_id, "account-a", [item["id"]]
+        )
+
+    scan = storage.get_cleanup_scan(scan_id, "account-a")
+    updated = storage.list_cleanup_items(scan_id)[0]
+    assert scan["status"] == "failed"
+    assert "verify failed" in scan["error"]
+    assert updated["removed"] == 0
+    assert "状态未知" in updated["remove_error"]
+
+
+@pytest.mark.asyncio
+async def test_retry_remove_reconciles_already_absent_items_before_resubmitting(tmp_path):
+    storage = Storage(tmp_path)
+    bili = MagicMock()
+    bili.batch_delete_resources = AsyncMock(return_value=True)
+    bili.get_folder_resource_ids = AsyncMock(return_value=[])
+    scan_id = storage.create_cleanup_scan("account-a", 1)
+    storage.update_cleanup_scan(scan_id, status="failed", error="上次确认失败")
+    storage.add_cleanup_items(scan_id, [{
+        "source_fid": 100, "source_title": "默认收藏夹", "resource_id": 1,
+        "resource_type": 2, "problem_type": "invalid", "problem_label": "已失效",
+    }])
+    item = storage.list_cleanup_items(scan_id)[0]
+    storage.mark_cleanup_item_removed(item["id"], False, "状态未知")
+
+    stats = await CleanupManager(storage, bili, sleep=AsyncMock()).remove(
+        scan_id, "account-a", [item["id"]]
+    )
+
+    assert stats == {"total": 1, "success": 1, "failed": 0}
+    bili.batch_delete_resources.assert_not_awaited()
+    assert storage.list_cleanup_items(scan_id)[0]["removed"] == 1
+
+
+@pytest.mark.asyncio
+async def test_cancelled_remove_is_persisted_as_cancelled(tmp_path):
+    storage = Storage(tmp_path)
+    release = asyncio.Event()
+    bili = MagicMock()
+    bili.batch_delete_resources = AsyncMock(return_value=True)
+
+    async def wait_for_ids(fid, storage=None):
+        await release.wait()
+        return []
+
+    bili.get_folder_resource_ids = wait_for_ids
+    scan_id = storage.create_cleanup_scan("account-a", 1)
+    storage.update_cleanup_scan(scan_id, status="ready")
+    storage.add_cleanup_items(scan_id, [{
+        "source_fid": 100, "source_title": "默认收藏夹", "resource_id": 1,
+        "resource_type": 2, "problem_type": "invalid", "problem_label": "已失效",
+    }])
+    item_id = storage.list_cleanup_items(scan_id)[0]["id"]
+    manager = CleanupManager(storage, bili, sleep=AsyncMock())
+    task = asyncio.create_task(manager.remove(scan_id, "account-a", [item_id]))
+    await asyncio.sleep(0)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert storage.get_cleanup_scan(scan_id, "account-a")["status"] == "cancelled"

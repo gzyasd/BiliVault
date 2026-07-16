@@ -13,6 +13,29 @@ def test_frontend_escapes_external_html_data():
     assert "${escapeHtml(it.error_message)}" in APP_JS
 
 
+def test_frontend_static_assets_are_local_and_precompiled():
+    assert "https://cdn.jsdelivr.net" not in INDEX_HTML
+    assert "https://unpkg.com" not in INDEX_HTML
+    assert "text/tailwindcss" not in INDEX_HTML
+    assert 'href="/static/app.css?v=' in INDEX_HTML
+    assert 'src="/static/vendor/lucide-1.8.0.min.js"' in INDEX_HTML
+    assert Path("static/app.css").stat().st_size > 10_000
+    assert Path("static/vendor/lucide-1.8.0.min.js").stat().st_size > 10_000
+
+
+def test_home_sticky_action_bar_is_opaque_and_above_folder_rows():
+    assert 'data-dom-id="home-action-bar"' in INDEX_HTML
+    assert (
+        'data-dom-id="home-action-bar" class="sticky bottom-0 z-20 mt-6 py-4"'
+        in INDEX_HTML
+    )
+    assert 'background: var(--background-50);' in INDEX_HTML
+
+
+def test_frontend_does_not_submit_ineffective_default_privacy_setting():
+    assert "default_privacy" not in APP_JS
+
+
 def test_frontend_handles_not_logged_in_from_home_fetches():
     assert "err.code = data.code" in APP_JS
     assert "if (e.code === 'NOT_LOGGED_IN')" in APP_JS
@@ -50,7 +73,8 @@ def test_utility_pages_return_to_the_originating_session_view():
     assert "openUtilityView('config')" in APP_JS
     assert "openUtilityView('accounts')" in APP_JS
     assert "$('config-cancel').onclick = returnFromUtilityView" in APP_JS
-    assert "$('accounts-back').onclick = returnFromUtilityView" in APP_JS
+    assert "$('accounts-back').onclick = async () =>" in APP_JS
+    assert "await returnFromUtilityView()" in APP_JS
 
 
 def test_utility_back_buttons_are_at_the_top_of_long_pages():
@@ -65,10 +89,13 @@ def test_utility_back_buttons_are_at_the_top_of_long_pages():
 
 
 def test_frontend_closes_event_source_on_view_switch():
-    assert "activeEventSource" in APP_JS
+    assert "const eventSources" in APP_JS
+    for slot in ("pipeline", "execution", "refine", "cleanup"):
+        assert f"{slot}: null" in APP_JS
+    assert "function replaceEventSource" in APP_JS
+    assert "function closeEventSource" in APP_JS
     assert "cleanupPollingAndSSE" in APP_JS
-    assert "es.close()" in APP_JS
-    assert "activeEventSource = null" in APP_JS
+    assert "source.close()" in APP_JS
 
 
 def test_frontend_qr_poll_uses_token_to_abort_stale():
@@ -133,12 +160,20 @@ def test_frontend_account_management_ui():
     assert "/api/accounts/login/poll" in APP_JS
     assert "/api/accounts/" in APP_JS
     assert "switch-account-" in APP_JS
+    assert "cancelAddAccountLogin" in APP_JS
+    assert "accounts/login/${encodeURIComponent(loginId)}/cancel" in APP_JS
 
 
 def test_frontend_progress_can_derive_percent_from_scanned_source_total():
     assert "deriveProgressPercent" in APP_JS
     assert "d.scanned" in APP_JS
     assert "d.source_total" in APP_JS
+
+
+def test_frontend_resumes_failed_pipeline_instead_of_opening_empty_review():
+    assert "function resumeSession" in APP_JS
+    assert "['draft', 'collecting', 'classifying', 'failed'].includes(session.status)" in APP_JS
+    assert "runPipeline(session.session_id, { reset: false })" in APP_JS
 
 
 def test_frontend_config_supports_ai_batch_size():
@@ -185,6 +220,14 @@ def test_frontend_execution_progress_uses_sse_and_shows_real_counts():
     assert "addEventListener('done'" in APP_JS
     assert "addEventListener('fail'" in APP_JS
     assert "EventSource.CLOSED" in APP_JS
+    assert "data.phase === 'reconciling'" in APP_JS
+    assert "正在核验上次执行进度" in APP_JS
+
+
+def test_frontend_execution_uses_post_start_and_job_scoped_stream():
+    assert "await api(`/api/session/${sid}/execute`, { method: 'POST' })" in APP_JS
+    assert "execute/stream?job_id=${encodeURIComponent(jobId)}" in APP_JS
+    assert "/execute/active" in APP_JS
 
 
 def test_frontend_home_allows_direct_delete_for_empty_non_default_folders():
@@ -315,6 +358,14 @@ def test_frontend_review_filter_preserves_running_refine_progress():
     assert "lastRefineProgress = { ...event }" in APP_JS
     assert "if (activeRefineJob)" in APP_JS
     assert "renderRefineProgress(sid, activeRefineKind, lastRefineProgress)" in APP_JS
+
+
+def test_frontend_reconnects_refine_progress_after_navigation_or_refresh():
+    assert "function connectRefineStream" in APP_JS
+    assert "async function restoreRefineJob" in APP_JS
+    assert "/refine/active" in APP_JS
+    assert "await openSession(sid)" in APP_JS
+    assert "connectRefineStream(sid, active.job_id" in APP_JS
 
 
 def test_frontend_has_account_cleanup_view_and_batch_controls():

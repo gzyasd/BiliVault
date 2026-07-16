@@ -41,6 +41,9 @@ CREATE TABLE IF NOT EXISTS classify_sessions (
   mode TEXT,
   category_limit INTEGER NOT NULL DEFAULT 14,
   account_id TEXT,
+  failed_stage TEXT DEFAULT '',
+  error_code TEXT DEFAULT '',
+  error_message TEXT DEFAULT '',
   created_at TEXT,
   updated_at TEXT,
   stats TEXT
@@ -158,6 +161,33 @@ CREATE TABLE IF NOT EXISTS classification_plan_items (
   executed INTEGER DEFAULT 0,
   PRIMARY KEY (version_id, resource_id, resource_type)
 );
+CREATE TABLE IF NOT EXISTS execution_runs (
+  run_id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL,
+  version_id TEXT DEFAULT '',
+  account_id TEXT DEFAULT '',
+  status TEXT NOT NULL,
+  processed INTEGER DEFAULT 0,
+  total INTEGER DEFAULT 0,
+  success INTEGER DEFAULT 0,
+  failed INTEGER DEFAULT 0,
+  error TEXT DEFAULT '',
+  created_at TEXT,
+  updated_at TEXT,
+  finished_at TEXT
+);
+CREATE TABLE IF NOT EXISTS execution_targets (
+  session_id TEXT NOT NULL,
+  version_id TEXT NOT NULL DEFAULT '',
+  category TEXT NOT NULL,
+  target_fid INTEGER DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'creating',
+  error TEXT DEFAULT '',
+  baseline_fids TEXT DEFAULT '[]',
+  created_at TEXT,
+  updated_at TEXT,
+  PRIMARY KEY (session_id, version_id, category)
+);
 CREATE TABLE IF NOT EXISTS cleanup_scans (
   scan_id TEXT PRIMARY KEY,
   account_id TEXT NOT NULL,
@@ -198,6 +228,7 @@ class Storage:
         self._config_path = self.base_dir / "config.json"
         self._cookie_path = self.base_dir / "bilibili_cookie.json"
         self._db_path = self.base_dir / "bibi.db"
+        self._migration_backup_path: Path | None = None
         self._init_db()
         self._migrate_schema()
 
@@ -248,12 +279,20 @@ class Storage:
                 conn.execute("ALTER TABLE classify_sessions ADD COLUMN account_id TEXT")
             if self._has_table(conn, "classify_sessions") and not self._has_column(conn, "classify_sessions", "category_limit"):
                 conn.execute("ALTER TABLE classify_sessions ADD COLUMN category_limit INTEGER NOT NULL DEFAULT 14")
+            if self._has_table(conn, "classify_sessions") and not self._has_column(conn, "classify_sessions", "failed_stage"):
+                conn.execute("ALTER TABLE classify_sessions ADD COLUMN failed_stage TEXT DEFAULT ''")
+            if self._has_table(conn, "classify_sessions") and not self._has_column(conn, "classify_sessions", "error_code"):
+                conn.execute("ALTER TABLE classify_sessions ADD COLUMN error_code TEXT DEFAULT ''")
+            if self._has_table(conn, "classify_sessions") and not self._has_column(conn, "classify_sessions", "error_message"):
+                conn.execute("ALTER TABLE classify_sessions ADD COLUMN error_message TEXT DEFAULT ''")
             if self._has_table(conn, "fav_folders") and not self._has_column(conn, "fav_folders", "account_id"):
                 conn.execute("ALTER TABLE fav_folders ADD COLUMN account_id TEXT")
             if self._has_table(conn, "session_sources") and not self._has_column(conn, "session_sources", "account_id"):
                 conn.execute("ALTER TABLE session_sources ADD COLUMN account_id TEXT")
             if self._has_table(conn, "session_sources") and not self._has_column(conn, "session_sources", "delete_protected"):
                 conn.execute("ALTER TABLE session_sources ADD COLUMN delete_protected INTEGER DEFAULT 0")
+            if self._has_table(conn, "execution_targets") and not self._has_column(conn, "execution_targets", "baseline_fids"):
+                conn.execute("ALTER TABLE execution_targets ADD COLUMN baseline_fids TEXT DEFAULT '[]'")
             self._migrate_wbi_keys_to_account_key(conn)
             self._migrate_videos_to_account_key(conn)
             self._migrate_fav_folders_to_account_key(conn)
@@ -261,6 +300,31 @@ class Storage:
             self._migrate_failed_items_to_resource_columns(conn)
             self._migrate_session_video_sources_to_resource_key(conn)
             self._migrate_classifications_to_resource_key(conn)
+            self._ensure_indexes(conn)
+
+    def _ensure_indexes(self, conn: sqlite3.Connection) -> None:
+        conn.executescript(
+            """
+            CREATE INDEX IF NOT EXISTS idx_sessions_account_status
+              ON classify_sessions(account_id, status, updated_at);
+            CREATE INDEX IF NOT EXISTS idx_skipped_items_session
+              ON skipped_items(session_id, removed, id);
+            CREATE INDEX IF NOT EXISTS idx_failed_items_session
+              ON failed_items(session_id, retried, id);
+            CREATE INDEX IF NOT EXISTS idx_plan_versions_session
+              ON classification_plan_versions(session_id, is_active, version_no);
+            CREATE INDEX IF NOT EXISTS idx_session_sources_session
+              ON session_sources(session_id, selected_order);
+            CREATE INDEX IF NOT EXISTS idx_session_resource_move_state
+              ON session_video_sources(session_id, moved);
+            CREATE INDEX IF NOT EXISTS idx_execution_runs_session_status
+              ON execution_runs(session_id, status, updated_at);
+            CREATE INDEX IF NOT EXISTS idx_cleanup_scans_account_created
+              ON cleanup_scans(account_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_cleanup_items_scan_state
+              ON cleanup_items(scan_id, removed, problem_type, source_fid);
+            """
+        )
 
     def _migrate_wbi_keys_to_account_key(self, conn: sqlite3.Connection) -> None:
         """旧 wbi_keys 表是 id INTEGER PRIMARY KEY CHECK (id=1) 单行结构，迁移为 account_id PRIMARY KEY。"""
@@ -279,43 +343,13 @@ class Storage:
             )
 
     def _migrate_videos_to_account_key(self, conn: sqlite3.Connection) -> None:
-        """旧 videos 表主键是单列 avid，迁移为 (account_id, avid) 组合主键。
-
-        注意：后续 _migrate_videos_to_resource_key 会进一步迁移到 (account_id, resource_id, resource_type)。
-        """
+        """把任意旧 videos 主键形态统一迁移到账号 + 资源组合键。"""
         if not self._has_table(conn, "videos"):
             return
         pk_cols = [row["name"] for row in conn.execute("PRAGMA table_info(videos)") if row["pk"]]
-        cols = {row["name"] for row in conn.execute("PRAGMA table_info(videos)")}
-        # 已经是 resource_key 结构则跳过
         if pk_cols == ["account_id", "resource_id", "resource_type"]:
             return
-        # 已有 resource_id/resource_type 列但主键未更新 → 交给 resource_key 迁移保留已有类型信息
-        if "resource_id" in cols or "resource_type" in cols:
-            self._migrate_videos_to_resource_key(conn)
-            return
-        # 已经是 (account_id, avid) 但缺 resource_id/resource_type 列 → 交给 resource_key 迁移
-        if pk_cols == ["account_id", "avid"] and "resource_id" not in cols:
-            self._migrate_videos_to_resource_key(conn)
-            return
-        need_backup = self._db_path.exists() and self._db_path.stat().st_size > 0
-        if need_backup:
-            self._backup_database()
-        legacy_cols = [row["name"] for row in conn.execute("PRAGMA table_info(videos)")]
-        has_account_id = "account_id" in legacy_cols
-        conn.execute("ALTER TABLE videos RENAME TO videos_legacy")
-        conn.execute(
-            "CREATE TABLE videos (account_id TEXT, resource_id INTEGER, resource_type INTEGER DEFAULT 2, "
-            "avid INTEGER, bvid TEXT, title TEXT, intro TEXT, tags TEXT, up_name TEXT, up_mid INTEGER, "
-            "cover_url TEXT, tname TEXT, fid INTEGER, cached_at TEXT, "
-            "PRIMARY KEY (account_id, resource_id, resource_type))"
-        )
-        col_list = "account_id, resource_id, resource_type, avid, bvid, title, intro, tags, up_name, up_mid, cover_url, tname, fid, cached_at"
-        if has_account_id:
-            conn.execute(f"INSERT OR REPLACE INTO videos ({col_list}) SELECT account_id, avid, 2, avid, bvid, title, intro, tags, up_name, up_mid, cover_url, tname, fid, cached_at FROM videos_legacy")
-        else:
-            conn.execute(f"INSERT OR REPLACE INTO videos ({col_list}) SELECT '', avid, 2, avid, bvid, title, intro, tags, up_name, up_mid, cover_url, tname, fid, cached_at FROM videos_legacy")
-        conn.execute("DROP TABLE videos_legacy")
+        self._migrate_videos_to_resource_key(conn)
 
     def _migrate_videos_to_resource_key(self, conn: sqlite3.Connection) -> None:
         """videos 表从 (account_id, avid) 主键迁移为 (account_id, resource_id, resource_type) 主键。
@@ -331,9 +365,6 @@ class Storage:
         need_backup = self._db_path.exists() and self._db_path.stat().st_size > 0
         if need_backup:
             self._backup_database()
-        has_resource_id = "resource_id" in cols
-        has_resource_type = "resource_type" in cols
-        has_avid = "avid" in cols
         conn.execute("ALTER TABLE videos RENAME TO videos_legacy")
         conn.execute(
             "CREATE TABLE videos (account_id TEXT, resource_id INTEGER, resource_type INTEGER DEFAULT 2, "
@@ -341,28 +372,44 @@ class Storage:
             "cover_url TEXT, tname TEXT, fid INTEGER, cached_at TEXT, "
             "PRIMARY KEY (account_id, resource_id, resource_type))"
         )
-        if has_resource_id and has_resource_type:
-            # 已有完整组合键列，保留原值；avid 缺失时按类型回填
-            conn.execute(
-                "INSERT OR REPLACE INTO videos (account_id, resource_id, resource_type, avid, bvid, title, intro, tags, up_name, up_mid, cover_url, tname, fid, cached_at) "
-                "SELECT account_id, resource_id, resource_type, "
-                "COALESCE(avid, CASE WHEN resource_type = 2 THEN resource_id ELSE 0 END), "
-                "bvid, title, intro, tags, up_name, up_mid, cover_url, tname, fid, cached_at FROM videos_legacy"
-            )
-        elif has_resource_id:
-            # 只有 resource_id，缺 resource_type：保留 resource_id，补默认类型 2
-            conn.execute(
-                "INSERT OR REPLACE INTO videos (account_id, resource_id, resource_type, avid, bvid, title, intro, tags, up_name, up_mid, cover_url, tname, fid, cached_at) "
-                "SELECT account_id, resource_id, 2, "
-                "COALESCE(avid, resource_id), "
-                "bvid, title, intro, tags, up_name, up_mid, cover_url, tname, fid, cached_at FROM videos_legacy"
-            )
+        account_expr = "COALESCE(account_id, '')" if "account_id" in cols else "''"
+        if "resource_id" in cols and "avid" in cols:
+            resource_expr = "COALESCE(resource_id, avid)"
+        elif "resource_id" in cols:
+            resource_expr = "resource_id"
+        elif "avid" in cols:
+            resource_expr = "avid"
         else:
-            # 旧表只有 avid，复制为 resource_id
-            conn.execute(
-                "INSERT OR REPLACE INTO videos (account_id, resource_id, resource_type, avid, bvid, title, intro, tags, up_name, up_mid, cover_url, tname, fid, cached_at) "
-                "SELECT account_id, avid, 2, avid, bvid, title, intro, tags, up_name, up_mid, cover_url, tname, fid, cached_at FROM videos_legacy"
-            )
+            resource_expr = "0"
+        type_expr = "COALESCE(resource_type, 2)" if "resource_type" in cols else "2"
+        if "avid" in cols:
+            avid_expr = f"COALESCE(avid, CASE WHEN {type_expr} = 2 THEN {resource_expr} ELSE 0 END)"
+        else:
+            avid_expr = f"CASE WHEN {type_expr} = 2 THEN {resource_expr} ELSE 0 END"
+
+        def legacy_value(column: str, default: str) -> str:
+            return column if column in cols else default
+
+        select_values = [
+            account_expr,
+            resource_expr,
+            type_expr,
+            avid_expr,
+            legacy_value("bvid", "''"),
+            legacy_value("title", "''"),
+            legacy_value("intro", "''"),
+            legacy_value("tags", "'[]'"),
+            legacy_value("up_name", "''"),
+            legacy_value("up_mid", "0"),
+            legacy_value("cover_url", "''"),
+            legacy_value("tname", "''"),
+            legacy_value("fid", "0"),
+            legacy_value("cached_at", "datetime('now')"),
+        ]
+        conn.execute(
+            "INSERT OR REPLACE INTO videos (account_id, resource_id, resource_type, avid, bvid, title, intro, tags, up_name, up_mid, cover_url, tname, fid, cached_at) "
+            f"SELECT {', '.join(select_values)} FROM videos_legacy"
+        )
         conn.execute("DROP TABLE videos_legacy")
 
     def _migrate_fav_folders_to_account_key(self, conn: sqlite3.Connection) -> None:
@@ -402,14 +449,7 @@ class Storage:
         need_backup = self._db_path.exists() and self._db_path.stat().st_size > 0
         if need_backup:
             self._backup_database()
-        select_cols = ["version_id", "avid", "category", "confidence", "reason", "adjusted", "executed"]
-        if "resource_id" in cols:
-            select_cols.insert(1, "resource_id")
-        if "resource_type" in cols:
-            select_cols.insert(2, "resource_type")
-        legacy_rows = conn.execute(
-            f"SELECT {', '.join(select_cols)} FROM classification_plan_items"
-        ).fetchall()
+        legacy_rows = conn.execute("SELECT * FROM classification_plan_items").fetchall()
         conn.execute("DROP TABLE classification_plan_items")
         conn.execute(
             "CREATE TABLE classification_plan_items (version_id TEXT, resource_id INTEGER, resource_type INTEGER DEFAULT 2, "
@@ -418,13 +458,19 @@ class Storage:
         )
         for row in legacy_rows:
             row_dict = dict(row)
-            resource_id = row_dict.get("resource_id", row_dict["avid"])
-            resource_type = row_dict.get("resource_type", 2)
+            resource_id = row_dict.get("resource_id")
+            if resource_id is None:
+                resource_id = row_dict.get("avid", 0)
+            resource_type = row_dict.get("resource_type") or 2
+            avid = row_dict.get("avid")
+            if avid is None:
+                avid = resource_id if resource_type == 2 else 0
             conn.execute(
                 "INSERT INTO classification_plan_items (version_id, resource_id, resource_type, avid, category, confidence, reason, adjusted, executed) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (row_dict["version_id"], resource_id, resource_type, row_dict["avid"], row_dict["category"],
-                 row_dict["confidence"], row_dict["reason"], row_dict["adjusted"], row_dict["executed"]),
+                (row_dict["version_id"], resource_id, resource_type, avid, row_dict.get("category", ""),
+                 row_dict.get("confidence", 0.0), row_dict.get("reason", ""),
+                 row_dict.get("adjusted", 0), row_dict.get("executed", 0)),
             )
 
     def _migrate_failed_items_to_resource_columns(self, conn: sqlite3.Connection) -> None:
@@ -502,14 +548,13 @@ class Storage:
         )
         for row in legacy_rows:
             rd = dict(row)
-            if has_resource_id and has_resource_type:
-                resource_id = rd.get("resource_id", rd.get("avid", 0))
-                resource_type = rd.get("resource_type", 2)
-                avid = rd.get("avid", resource_id if resource_type == 2 else 0)
-            else:
+            resource_id = rd.get("resource_id") if has_resource_id else rd.get("avid", 0)
+            if resource_id is None:
                 resource_id = rd.get("avid", 0)
-                resource_type = 2
-                avid = rd.get("avid", 0)
+            resource_type = (rd.get("resource_type") if has_resource_type else 2) or 2
+            avid = rd.get("avid")
+            if avid is None:
+                avid = resource_id if resource_type == 2 else 0
             conn.execute(
                 "INSERT OR REPLACE INTO classifications (session_id, resource_id, resource_type, avid, category, confidence, reason, adjusted, executed) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -518,14 +563,20 @@ class Storage:
                  rd.get("adjusted", 0), rd.get("executed", 0)),
             )
 
-    def _backup_database(self) -> None:
+    def _backup_database(self) -> Path | None:
         """破坏性表重建前备份当前数据库文件。"""
         if not self._db_path.exists():
-            return
+            return None
+        if self._migration_backup_path is not None:
+            return self._migration_backup_path
         from datetime import datetime
-        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-        backup_path = self._db_path.with_name(f"bibi.db.backup-{ts}")
-        backup_path.write_bytes(self._db_path.read_bytes())
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        backup_path = self._db_path.with_name(f"bibi.db.backup-{ts}-{uuid.uuid4().hex[:8]}")
+        with self._db_path.open("rb") as source, backup_path.open("xb") as target:
+            while chunk := source.read(1024 * 1024):
+                target.write(chunk)
+        self._migration_backup_path = backup_path
+        return backup_path
 
     def upsert_folder(self, folder: dict) -> None:
         with self._conn() as conn:
@@ -557,6 +608,61 @@ class Storage:
                 {**video, "account_id": account_id, "resource_id": resource_id, "resource_type": resource_type, "avid": avid},
             )
 
+    def save_collected_page(
+        self,
+        session_id: str,
+        account_id: str | None,
+        source_fid: int,
+        videos: list[dict],
+        skipped_items: list[dict],
+    ) -> None:
+        """Persist one collected page atomically using a single SQLite transaction."""
+        video_rows = []
+        source_rows = []
+        for video in videos:
+            resource_id = video.get("resource_id", video.get("avid"))
+            resource_type = video.get("resource_type", 2)
+            avid = video.get("avid", resource_id if resource_type == 2 else 0)
+            video_rows.append((
+                account_id or "", resource_id, resource_type, avid,
+                video.get("bvid", ""), video.get("title", ""), video.get("intro", ""),
+                video.get("tags", "[]"), video.get("up_name", ""), video.get("up_mid", 0),
+                video.get("cover_url", ""), video.get("tname", ""), source_fid,
+            ))
+            source_rows.append((session_id, resource_id, resource_type, source_fid))
+
+        skipped_rows = [
+            (
+                session_id, account_id, item["source_fid"], item.get("avid", 0),
+                item.get("bvid", ""), item.get("title", ""), item.get("resource_type", 0),
+                item.get("raw_attr", 0), item["reason_code"], item["reason_label"],
+                item.get("detail", ""), 1 if item.get("removable") else 0,
+            )
+            for item in skipped_items
+        ]
+
+        with self._conn() as conn:
+            if video_rows:
+                conn.executemany(
+                    "INSERT OR REPLACE INTO videos "
+                    "(account_id, resource_id, resource_type, avid, bvid, title, intro, tags, up_name, up_mid, cover_url, tname, fid, cached_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))",
+                    video_rows,
+                )
+                conn.executemany(
+                    "INSERT OR IGNORE INTO session_video_sources "
+                    "(session_id, resource_id, resource_type, source_fid, moved, move_error, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, 0, '', datetime('now'), datetime('now'))",
+                    source_rows,
+                )
+            if skipped_rows:
+                conn.executemany(
+                    "INSERT INTO skipped_items "
+                    "(session_id, account_id, source_fid, avid, bvid, title, resource_type, raw_attr, reason_code, reason_label, detail, removable, removed, remove_error, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, '', datetime('now'), datetime('now'))",
+                    skipped_rows,
+                )
+
     def list_videos_by_fid(self, fid: int) -> list[dict]:
         with self._conn() as conn:
             rows = conn.execute(
@@ -572,13 +678,20 @@ class Storage:
         """
         if not avids:
             return []
-        placeholders = ",".join("?" * len(avids))
+        unique_ids = list(dict.fromkeys(int(avid) for avid in avids))
+        rows_by_key: dict[tuple[int, int], dict] = {}
         with self._conn() as conn:
-            rows = conn.execute(
-                f"SELECT * FROM videos WHERE account_id = ? AND resource_id IN ({placeholders}) ORDER BY resource_id, resource_type",
-                [account_id or "", *avids],
-            ).fetchall()
-            return [dict(r) for r in rows]
+            for start in range(0, len(unique_ids), 300):
+                chunk = unique_ids[start:start + 300]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = conn.execute(
+                    f"SELECT * FROM videos WHERE account_id = ? AND resource_id IN ({placeholders})",
+                    [account_id or "", *chunk],
+                ).fetchall()
+                for row in rows:
+                    item = dict(row)
+                    rows_by_key[(item["resource_id"], item["resource_type"])] = item
+        return [rows_by_key[key] for key in sorted(rows_by_key)]
 
     def list_videos_by_resource_keys(self, keys: list[tuple[int, int]], account_id: str | None = None) -> list[dict]:
         """按 (resource_id, resource_type) 组合键列表精确查询视频缓存。
@@ -587,16 +700,24 @@ class Storage:
         """
         if not keys:
             return []
-        clauses = " OR ".join(["(resource_id = ? AND resource_type = ?)"] * len(keys))
-        params: list = [account_id or ""]
-        for rid, rtype in keys:
-            params.extend([rid, rtype])
+        unique_keys = list(dict.fromkeys((int(rid), int(rtype)) for rid, rtype in keys))
+        result_by_key: dict[tuple[int, int], dict] = {}
         with self._conn() as conn:
-            rows = conn.execute(
-                f"SELECT * FROM videos WHERE account_id = ? AND ({clauses}) ORDER BY resource_id, resource_type",
-                params,
-            ).fetchall()
-            return [dict(r) for r in rows]
+            for start in range(0, len(unique_keys), 300):
+                chunk = unique_keys[start:start + 300]
+                pairs = ",".join("(?, ?)" for _ in chunk)
+                params: list = [account_id or ""]
+                for rid, rtype in chunk:
+                    params.extend([rid, rtype])
+                rows = conn.execute(
+                    f"SELECT * FROM videos WHERE account_id = ? "
+                    f"AND (resource_id, resource_type) IN ({pairs})",
+                    params,
+                ).fetchall()
+                for row in rows:
+                    item = dict(row)
+                    result_by_key[(item["resource_id"], item["resource_type"])] = item
+        return [result_by_key[key] for key in sorted(result_by_key)]
 
     def create_session(self, source_fid: int, mode: str, category_limit: int = 14) -> str:
         session_id = str(uuid.uuid4())
@@ -615,6 +736,14 @@ class Storage:
             ).fetchone()
             return dict(row) if row else None
 
+    def load_session_for_account(self, session_id: str, account_id: str) -> dict | None:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM classify_sessions WHERE session_id = ? AND account_id = ?",
+                (session_id, account_id),
+            ).fetchone()
+            return dict(row) if row else None
+
     def update_session_status(self, session_id: str, status: str, stats: dict | None = None) -> None:
         if stats is not None:
             with self._conn() as conn:
@@ -629,6 +758,43 @@ class Storage:
                     (status, session_id),
                 )
 
+    def mark_session_failed(self, session_id: str, stage: str, error_code: str, error_message: str) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE classify_sessions SET status = 'failed', failed_stage = ?, error_code = ?, "
+                "error_message = ?, updated_at = datetime('now') WHERE session_id = ?",
+                (stage, error_code, error_message, session_id),
+            )
+
+    def clear_session_failure(self, session_id: str, status: str) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE classify_sessions SET status = ?, failed_stage = '', error_code = '', "
+                "error_message = '', updated_at = datetime('now') WHERE session_id = ?",
+                (status, session_id),
+            )
+
+    def reset_session_collection(self, session_id: str) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                "DELETE FROM classification_plan_items WHERE version_id IN "
+                "(SELECT version_id FROM classification_plan_versions WHERE session_id = ?)",
+                (session_id,),
+            )
+            conn.execute("DELETE FROM classification_plan_versions WHERE session_id = ?", (session_id,))
+            conn.execute("DELETE FROM classifications WHERE session_id = ?", (session_id,))
+            conn.execute("DELETE FROM session_video_sources WHERE session_id = ?", (session_id,))
+            conn.execute("DELETE FROM skipped_items WHERE session_id = ?", (session_id,))
+            conn.execute("DELETE FROM failed_items WHERE session_id = ?", (session_id,))
+            conn.execute("DELETE FROM execution_targets WHERE session_id = ?", (session_id,))
+            conn.execute("DELETE FROM execution_runs WHERE session_id = ?", (session_id,))
+            conn.execute(
+                "UPDATE session_sources SET collected_count = 0, skipped_count = 0, "
+                "emptied_after_execute = 0, delete_candidate = 0, deleted = 0, delete_error = '', "
+                "updated_at = datetime('now') WHERE session_id = ?",
+                (session_id,),
+            )
+
     def update_session_account(self, session_id: str, account_id: str) -> None:
         with self._conn() as conn:
             conn.execute(
@@ -636,13 +802,21 @@ class Storage:
                 (account_id, session_id),
             )
 
-    def list_sessions_by_status(self, statuses: list[str]) -> list[dict]:
+    def list_sessions_by_status(self, statuses: list[str], account_id: str | None = None) -> list[dict]:
+        if not statuses:
+            return []
         placeholders = ",".join("?" * len(statuses))
         with self._conn() as conn:
-            rows = conn.execute(
-                f"SELECT * FROM classify_sessions WHERE status IN ({placeholders}) ORDER BY updated_at DESC",
-                statuses,
-            ).fetchall()
+            if account_id is None:
+                rows = conn.execute(
+                    f"SELECT * FROM classify_sessions WHERE status IN ({placeholders}) ORDER BY updated_at DESC",
+                    statuses,
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    f"SELECT * FROM classify_sessions WHERE account_id = ? AND status IN ({placeholders}) ORDER BY updated_at DESC",
+                    [account_id, *statuses],
+                ).fetchall()
             return [dict(r) for r in rows]
 
     def save_classifications(self, session_id: str, items: list[dict]) -> None:
@@ -755,6 +929,109 @@ class Storage:
                 "UPDATE classification_plan_items SET executed = ? WHERE version_id = ? AND resource_id = ? AND resource_type = ?",
                 (1 if ok else 0, version_id, resource_id, resource_type),
             )
+
+    def create_execution_run(
+        self,
+        session_id: str,
+        version_id: str | None,
+        account_id: str,
+        run_id: str | None = None,
+    ) -> str:
+        run_id = run_id or str(uuid.uuid4())
+        with self._conn() as conn:
+            conn.execute(
+                "INSERT INTO execution_runs (run_id, session_id, version_id, account_id, status, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, 'queued', datetime('now'), datetime('now'))",
+                (run_id, session_id, version_id or "", account_id or ""),
+            )
+        return run_id
+
+    def get_execution_run(self, run_id: str, account_id: str | None = None) -> dict | None:
+        with self._conn() as conn:
+            if account_id is None:
+                row = conn.execute(
+                    "SELECT * FROM execution_runs WHERE run_id = ?", (run_id,)
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT * FROM execution_runs WHERE run_id = ? AND account_id = ?",
+                    (run_id, account_id),
+                ).fetchone()
+            return dict(row) if row else None
+
+    def get_latest_execution_run(self, session_id: str, statuses: list[str] | None = None) -> dict | None:
+        params: list = [session_id]
+        where = "session_id = ?"
+        if statuses:
+            placeholders = ",".join("?" * len(statuses))
+            where += f" AND status IN ({placeholders})"
+            params.extend(statuses)
+        with self._conn() as conn:
+            row = conn.execute(
+                f"SELECT * FROM execution_runs WHERE {where} ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                params,
+            ).fetchone()
+            return dict(row) if row else None
+
+    def update_execution_run(self, run_id: str, **values) -> None:
+        allowed = {"status", "processed", "total", "success", "failed", "error"}
+        updates = [(key, value) for key, value in values.items() if key in allowed]
+        if not updates:
+            return
+        assignments = ", ".join(f"{key} = ?" for key, _ in updates)
+        finished = ", finished_at = datetime('now')" if values.get("status") in {"completed", "failed", "cancelled"} else ""
+        with self._conn() as conn:
+            conn.execute(
+                f"UPDATE execution_runs SET {assignments}, updated_at = datetime('now'){finished} WHERE run_id = ?",
+                [*[value for _, value in updates], run_id],
+            )
+
+    def mark_execution_runs_interrupted(self, session_id: str) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE execution_runs SET status = 'interrupted', updated_at = datetime('now') "
+                "WHERE session_id = ? AND status IN ('queued', 'running')",
+                (session_id,),
+            )
+
+    def save_execution_target(
+        self,
+        session_id: str,
+        version_id: str | None,
+        category: str,
+        target_fid: int,
+        status: str = "ready",
+        error: str = "",
+        baseline_fids: list[int] | None = None,
+    ) -> None:
+        with self._conn() as conn:
+            existing = conn.execute(
+                "SELECT baseline_fids FROM execution_targets WHERE session_id = ? AND version_id = ? AND category = ?",
+                (session_id, version_id or "", category),
+            ).fetchone()
+            if baseline_fids is None and existing:
+                baseline_json = existing["baseline_fids"] or "[]"
+            else:
+                baseline_json = json.dumps(
+                    sorted({int(fid) for fid in (baseline_fids or [])}),
+                    ensure_ascii=False,
+                )
+            conn.execute(
+                "INSERT INTO execution_targets (session_id, version_id, category, target_fid, status, error, baseline_fids, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now')) "
+                "ON CONFLICT(session_id, version_id, category) DO UPDATE SET "
+                "target_fid=excluded.target_fid, status=excluded.status, error=excluded.error, "
+                "baseline_fids=excluded.baseline_fids, updated_at=datetime('now')",
+                (session_id, version_id or "", category, int(target_fid or 0), status, error, baseline_json),
+            )
+
+    def get_execution_target(self, session_id: str, version_id: str | None, category: str) -> dict | None:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM execution_targets WHERE session_id = ? AND version_id = ? AND category = ?",
+                (session_id, version_id or "", category),
+            ).fetchone()
+            return dict(row) if row else None
 
     def migrate_legacy_classifications_to_version(self, session_id: str) -> str | None:
         active = self.get_active_plan_version(session_id)
@@ -869,6 +1146,15 @@ class Storage:
                 (1 if ok else 0, error, session_id, resource_id, resource_type, source_fid),
             )
 
+    def are_all_session_video_sources_moved(self, session_id: str, resource_id: int, resource_type: int = 2) -> bool:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS total, COALESCE(SUM(moved), 0) AS moved "
+                "FROM session_video_sources WHERE session_id = ? AND resource_id = ? AND resource_type = ?",
+                (session_id, resource_id, resource_type),
+            ).fetchone()
+            return not row["total"] or row["moved"] == row["total"]
+
     def list_failed_session_video_sources(self, session_id: str) -> list[dict]:
         with self._conn() as conn:
             rows = conn.execute(
@@ -920,13 +1206,20 @@ class Storage:
     def list_skipped_items_by_ids(self, session_id: str, item_ids: list[int]) -> list[dict]:
         if not item_ids:
             return []
-        placeholders = ",".join("?" * len(item_ids))
+        unique_ids = list(dict.fromkeys(int(item_id) for item_id in item_ids))
+        rows_by_id: dict[int, dict] = {}
         with self._conn() as conn:
-            rows = conn.execute(
-                f"SELECT * FROM skipped_items WHERE session_id = ? AND id IN ({placeholders}) ORDER BY id",
-                [session_id, *item_ids],
-            ).fetchall()
-            return [dict(r) for r in rows]
+            for start in range(0, len(unique_ids), 300):
+                chunk = unique_ids[start:start + 300]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = conn.execute(
+                    f"SELECT * FROM skipped_items WHERE session_id = ? AND id IN ({placeholders})",
+                    [session_id, *chunk],
+                ).fetchall()
+                for row in rows:
+                    item = dict(row)
+                    rows_by_id[item["id"]] = item
+        return [rows_by_id[item_id] for item_id in sorted(rows_by_id)]
 
     def mark_skipped_item_removed(self, item_id: int, ok: bool, error: str = "") -> None:
         with self._conn() as conn:
@@ -1005,16 +1298,31 @@ class Storage:
             ).fetchall()
             return [dict(row) for row in rows]
 
+    def count_cleanup_items(self, scan_id: str) -> int:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS total FROM cleanup_items WHERE scan_id = ?",
+                (scan_id,),
+            ).fetchone()
+            return int(row["total"] if row else 0)
+
     def list_cleanup_items_by_ids(self, scan_id: str, item_ids: list[int]) -> list[dict]:
         if not item_ids:
             return []
-        placeholders = ",".join("?" for _ in item_ids)
+        unique_ids = list(dict.fromkeys(int(item_id) for item_id in item_ids))
+        rows_by_id: dict[int, dict] = {}
         with self._conn() as conn:
-            rows = conn.execute(
-                f"SELECT * FROM cleanup_items WHERE scan_id = ? AND id IN ({placeholders}) ORDER BY id",
-                [scan_id, *item_ids],
-            ).fetchall()
-            return [dict(row) for row in rows]
+            for start in range(0, len(unique_ids), 300):
+                chunk = unique_ids[start:start + 300]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = conn.execute(
+                    f"SELECT * FROM cleanup_items WHERE scan_id = ? AND id IN ({placeholders})",
+                    [scan_id, *chunk],
+                ).fetchall()
+                for row in rows:
+                    item = dict(row)
+                    rows_by_id[item["id"]] = item
+        return [rows_by_id[item_id] for item_id in sorted(rows_by_id)]
 
     def mark_cleanup_item_removed(self, item_id: int, ok: bool, error: str = "") -> None:
         with self._conn() as conn:

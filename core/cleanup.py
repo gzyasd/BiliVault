@@ -5,6 +5,9 @@ from collections import defaultdict
 from core.errors import BibiError
 
 
+MAX_CLEANUP_PAGES_WITHOUT_TOTAL = 5000
+
+
 class CleanupManager:
     def __init__(self, storage, bili_client, sleep=asyncio.sleep):
         self.storage = storage
@@ -45,8 +48,19 @@ class CleanupManager:
                         page_size=20,
                         storage=self.storage,
                     )
+                    page_items = data.get("items", [])
+                    page_keys = {
+                        (int(item.get("resource_id") or 0), int(item.get("resource_type") or 2))
+                        for item in page_items
+                        if item.get("resource_id")
+                    }
+                    if page_items and data.get("has_more") and not (page_keys - seen_keys):
+                        raise BibiError(
+                            f"收藏夹 {title} 第 {page} 页分页重复，未发现新增资源",
+                            code="BILI_PAGINATION_STALLED",
+                        )
                     problem_items = []
-                    for item in data.get("items", []):
+                    for item in page_items:
                         resource_id = int(item.get("resource_id") or 0)
                         resource_type = int(item.get("resource_type") or 2)
                         if not resource_id:
@@ -65,10 +79,10 @@ class CleanupManager:
                             })
                     if problem_items:
                         self.storage.add_cleanup_items(scan_id, problem_items)
-                    page_item_count = len(data.get("items", []))
+                    page_item_count = len(page_items)
                     folder_detail_scanned += page_item_count
                     resources_scanned += page_item_count
-                    problem_total = len(self.storage.list_cleanup_items(scan_id))
+                    problem_total = self.storage.count_cleanup_items(scan_id)
                     await self._emit(on_progress, {
                         "stage": "scanning",
                         "folders_scanned": folder_index - 1,
@@ -80,6 +94,19 @@ class CleanupManager:
                     })
                     if not data.get("has_more"):
                         break
+                    declared_total = int(data.get("total") or folder.get("media_count") or 0)
+                    if declared_total:
+                        max_pages = max(1, (declared_total + 19) // 20) + 5
+                        if page + 1 > max_pages:
+                            raise BibiError(
+                                f"收藏夹 {title} 分页超过声明总数，已停止扫描",
+                                code="BILI_PAGINATION_LIMIT",
+                            )
+                    elif page + 1 > MAX_CLEANUP_PAGES_WITHOUT_TOTAL:
+                        raise BibiError(
+                            f"收藏夹 {title} 分页超过安全上限，已停止扫描",
+                            code="BILI_PAGINATION_LIMIT",
+                        )
                     page += 1
                     await self._sleep(0.3)
 
@@ -108,7 +135,7 @@ class CleanupManager:
                     })
                 if inaccessible:
                     self.storage.add_cleanup_items(scan_id, inaccessible)
-                problem_total = len(self.storage.list_cleanup_items(scan_id))
+                problem_total = self.storage.count_cleanup_items(scan_id)
                 self.storage.update_cleanup_scan(
                     scan_id,
                     folders_scanned=folder_index,
@@ -153,6 +180,30 @@ class CleanupManager:
         return {"scan": scan, "items": self.storage.list_cleanup_items(scan_id)}
 
     async def remove(self, scan_id: str, account_id: str, item_ids: list[int], on_progress=None) -> dict:
+        try:
+            return await self._remove_once(scan_id, account_id, item_ids, on_progress=on_progress)
+        except asyncio.CancelledError:
+            self.storage.update_cleanup_scan(
+                scan_id, status="cancelled", error="删除任务已取消，未确认条目将在重试时重新核验",
+                current_folder_title="",
+            )
+            self._mark_unconfirmed_items(scan_id, item_ids, "删除任务已取消，状态未知，请重新核验")
+            raise
+        except Exception as exc:
+            self.storage.update_cleanup_scan(
+                scan_id, status="failed", error=str(exc), current_folder_title=""
+            )
+            self._mark_unconfirmed_items(
+                scan_id, item_ids, f"删除后确认失败，状态未知：{exc}"
+            )
+            raise
+
+    def _mark_unconfirmed_items(self, scan_id: str, item_ids: list[int], error: str) -> None:
+        for item in self.storage.list_cleanup_items_by_ids(scan_id, item_ids):
+            if not item["removed"] and not item.get("remove_error"):
+                self.storage.mark_cleanup_item_removed(item["id"], False, error)
+
+    async def _remove_once(self, scan_id: str, account_id: str, item_ids: list[int], on_progress=None) -> dict:
         scan = self.storage.get_cleanup_scan(scan_id, account_id=account_id)
         if not scan:
             raise BibiError("清理任务不存在或不属于当前账号", code="CLEANUP_SCAN_NOT_FOUND")
@@ -160,6 +211,7 @@ class CleanupManager:
             item for item in self.storage.list_cleanup_items_by_ids(scan_id, item_ids)
             if not item["removed"]
         ]
+        is_retry = scan.get("status") in {"failed", "cancelled", "completed"}
         self.storage.update_cleanup_scan(scan_id, status="removing", error="")
         by_folder: dict[int, list[dict]] = defaultdict(list)
         for item in items:
@@ -168,9 +220,24 @@ class CleanupManager:
         failed = 0
         processed = 0
         for source_fid, source_items in by_folder.items():
+            pending_items = source_items
+            if is_retry:
+                current_keys = {
+                    (int(item.get("resource_id") or 0), int(item.get("resource_type") or 2))
+                    for item in await self.bili.get_folder_resource_ids(source_fid, storage=self.storage)
+                }
+                pending_items = []
+                for item in source_items:
+                    key = (item["resource_id"], item.get("resource_type") or 2)
+                    if key in current_keys:
+                        pending_items.append(item)
+                        continue
+                    self.storage.mark_cleanup_item_removed(item["id"], True, "")
+                    success += 1
+                    processed += 1
             submitted = []
-            for start in range(0, len(source_items), 50):
-                chunk = source_items[start:start + 50]
+            for start in range(0, len(pending_items), 50):
+                chunk = pending_items[start:start + 50]
                 try:
                     await self.bili.batch_delete_resources(
                         media_id=source_fid,

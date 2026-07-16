@@ -1,0 +1,25 @@
+@import "tailwindcss";
+
+@source "./index.html";
+@source "./app.js";
+
+@theme inline {
+  --color-foreground: var(--card-foreground);
+}
+
+@layer base {
+  body {
+    background: linear-gradient(180deg, var(--background-100), var(--background-200));
+    color: var(--foreground);
+  }
+
+  td,
+  th {
+    overflow-wrap: break-word;
+    word-break: break-all;
+  }
+
+  th {
+    white-space: nowrap;
+  }
+}
